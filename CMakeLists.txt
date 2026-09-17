@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(syscall_static_extractor LANGUAGES C CXX)
+find_package(LLVM REQUIRED CONFIG)
+find_package(Clang REQUIRED CONFIG)
+add_executable(syscall-extract src/main.cpp)
+target_compile_features(syscall-extract PRIVATE cxx_std_17)
+target_include_directories(syscall-extract SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+target_link_libraries(syscall-extract PRIVATE clang-cpp LLVM)
