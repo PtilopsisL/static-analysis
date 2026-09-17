@@ -1,11 +1,39 @@
-/* Analysis inputs only: these functions must never be compiled and executed. */
-#define _GNU_SOURCE
-#include "kselftest_harness.h"
-#include <errno.h>
-#include <linux/openat2.h>
-#include <stdint.h>
-#include <sys/syscall.h>
-#include <unistd.h>
+/* Analysis inputs only: these functions must never be linked or executed. */
+#define __NR_pidfd_open 434
+#define __NR_pidfd_getfd 438
+#define __NR_openat2 437
+#define EIO 5
+#define ESRCH 3
+#define EINVAL 22
+#define errno (*__errno_location())
+
+extern int *__errno_location(void) __attribute__((const));
+extern long syscall(long number, ...);
+extern int fprintf(void *stream, const char *format, ...);
+extern void *stderr;
+
+struct open_how {
+  unsigned long long flags;
+  unsigned long long mode;
+  unsigned long long resolve;
+};
+
+#define TEST(name) static void name(void)
+#define EXPECT_OP(expected, seen, op)                                      \
+  do {                                                                    \
+    __typeof__(expected) __exp = (expected);                              \
+    __typeof__(seen) __seen = (seen);                                     \
+    if (!(__exp op __seen)) {                                             \
+    }                                                                     \
+  } while (0)
+#define EXPECT_EQ(expected, seen) EXPECT_OP(expected, seen, ==)
+#define ASSERT_EQ(expected, seen) EXPECT_EQ(expected, seen)
+#define EXPECT_GE(expected, seen) EXPECT_OP(expected, seen, >=)
+#define TH_LOG(message)                                                    \
+  do {                                                                    \
+    if (1)                                                                \
+      fprintf(stderr, "# %s:%d:%s:" message, __FILE__, __LINE__, __func__); \
+  } while (0)
 
 extern void unrelated_call(void);
 extern int unknown_value(void);
@@ -27,8 +55,10 @@ TEST(constant_error) {
 
 TEST(guarded_error) {
   long ret = getfd(0, 0, 1);
-  if (ret < 0)
+  if (ret < 0) {
+    TH_LOG("expected failure");
     EXPECT_EQ(errno, EINVAL);
+  }
 }
 
 TEST(stale_errno) {

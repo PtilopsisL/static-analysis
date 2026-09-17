@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(syscall_static_extractor LANGUAGES C CXX)
+project(syscall_static_extractor LANGUAGES CXX)
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
 add_executable(syscall-extract src/main.cpp)

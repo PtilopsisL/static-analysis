@@ -1,17 +1,22 @@
-// Static extraction of kselftest expectations. No analyzed program is executed.
+// Static extraction of syscall expectations from preprocessed translation units.
+// No analyzed program is compiled, linked, or executed.
 #include <algorithm>
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Lex/Lexer.h>
-#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/JSON.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <set>
@@ -27,11 +32,122 @@ static llvm::cl::list<std::string>
 static llvm::cl::list<std::string>
     Syscalls("syscall", llvm::cl::desc("Syscall to report (repeatable)"),
              llvm::cl::cat(Category));
+static llvm::cl::opt<bool>
+    AllFunctions("all-functions",
+                 llvm::cl::desc("Analyze every function defined by the original source"),
+                 llvm::cl::init(false), llvm::cl::cat(Category));
 static llvm::cl::opt<unsigned> LoopLimit("loop-limit", llvm::cl::init(128),
                                          llvm::cl::cat(Category));
-static llvm::cl::opt<bool> Discover(
-    "discover", llvm::cl::desc("List test entries without analyzing their bodies"),
-    llvm::cl::init(false), llvm::cl::cat(Category));
+static llvm::cl::opt<std::string>
+    Bitcode("bitcode", llvm::cl::desc("Optional sibling LLVM bitcode used to infer the target"),
+            llvm::cl::value_desc("file.bc"), llvm::cl::cat(Category));
+static llvm::cl::opt<std::string>
+    Target("target", llvm::cl::desc("Override the Clang target triple"),
+           llvm::cl::value_desc("triple"), llvm::cl::cat(Category));
+static llvm::cl::opt<std::string>
+    SourceFile("source-file", llvm::cl::desc("Override the original source path from line markers"),
+               llvm::cl::value_desc("path"), llvm::cl::cat(Category));
+static llvm::cl::opt<std::string>
+    InputFile(llvm::cl::Positional, llvm::cl::desc("<preprocessed .i/.ii>"),
+              llvm::cl::Required, llvm::cl::cat(Category));
+
+static std::string PrimarySource;
+static std::string TargetOrigin = "host_default";
+static std::vector<std::string> StartupWarnings;
+static std::map<int64_t, std::string> SyscallNames;
+
+static std::optional<std::string> lineMarkerFile(llvm::StringRef line) {
+  line = line.trim();
+  if (!line.consume_front("#"))
+    return std::nullopt;
+  line = line.ltrim();
+  size_t digits = line.find_first_not_of("0123456789");
+  if (digits == llvm::StringRef::npos || digits == 0)
+    return std::nullopt;
+  line = line.drop_front(digits).ltrim();
+  if (!line.consume_front("\""))
+    return std::nullopt;
+  size_t end = line.find('"');
+  if (end == llvm::StringRef::npos)
+    return std::nullopt;
+  llvm::StringRef file = line.take_front(end);
+  if (file.starts_with("<") && file.ends_with(">"))
+    return std::nullopt;
+  return file.str();
+}
+
+static bool parseInteger(llvm::StringRef text, int64_t &value) {
+  text = text.trim();
+  while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
+    text = text.drop_front().drop_back().trim();
+  std::string storage = text.str();
+  char *end = nullptr;
+  long long parsed = std::strtoll(storage.c_str(), &end, 0);
+  if (end == storage.c_str())
+    return false;
+  while (*end == 'u' || *end == 'U' || *end == 'l' || *end == 'L' ||
+         *end == ' ' || *end == '\t')
+    ++end;
+  if (*end)
+    return false;
+  value = parsed;
+  return true;
+}
+
+static bool inspectPreprocessedInput(llvm::StringRef path) {
+  auto input = llvm::MemoryBuffer::getFile(path);
+  if (!input) {
+    llvm::errs() << "Unable to read input: " << input.getError().message() << "\n";
+    return false;
+  }
+  llvm::StringRef text = input.get()->getBuffer();
+  while (!text.empty()) {
+    auto split = text.split('\n');
+    llvm::StringRef line = split.first;
+    text = split.second;
+    if (PrimarySource.empty())
+      if (auto file = lineMarkerFile(line))
+        PrimarySource = *file;
+
+    line = line.trim();
+    constexpr llvm::StringLiteral Prefix("#define __NR_");
+    if (!line.consume_front(Prefix))
+      continue;
+    size_t space = line.find_first_of(" \t");
+    if (space == llvm::StringRef::npos)
+      continue;
+    llvm::StringRef name = line.take_front(space);
+    int64_t number;
+    if (name.empty() || name == "Linux" || name == "syscalls" ||
+        name == "arch_specific_syscall" ||
+        !parseInteger(line.drop_front(space), number))
+      continue;
+    SyscallNames.try_emplace(number, name.str());
+  }
+  if (PrimarySource.empty())
+    StartupWarnings.push_back("original source path was not found in line markers");
+  return true;
+}
+
+static std::optional<std::string> bitcodeTarget(llvm::StringRef path) {
+  auto input = llvm::MemoryBuffer::getFile(path);
+  if (!input) {
+    StartupWarnings.push_back("unable to read bitcode target metadata: " +
+                              input.getError().message());
+    return std::nullopt;
+  }
+  auto triple = llvm::getBitcodeTargetTriple(input.get()->getMemBufferRef());
+  if (!triple) {
+    StartupWarnings.push_back("unable to parse bitcode target metadata: " +
+                              llvm::toString(triple.takeError()));
+    return std::nullopt;
+  }
+  if (triple->empty()) {
+    StartupWarnings.push_back("bitcode does not contain a target triple");
+    return std::nullopt;
+  }
+  return *triple;
+}
 
 // Symbolic values deliberately preserve unknowns rather than inventing
 // constants.
@@ -253,53 +369,15 @@ class Extractor {
   SourceManager &SM;
   std::map<std::string, const FunctionDecl *> definitions;
   std::vector<Invocation> calls;
+  J::Array records;
+  J::Array functions;
+  std::set<std::string> seenRecords;
+  std::set<std::string> incompleteReasons;
   unsigned depth = 0;
-  bool testIncomplete = false;
+  bool analysisIncomplete = false;
 
 public:
   explicit Extractor(ASTContext &c) : C(c), SM(c.getSourceManager()) {}
-  std::string macroAt(SourceLocation loc) {
-    if (!loc.isMacroID())
-      return "";
-    loc = SM.getExpansionLoc(loc);
-    return Lexer::getSourceText(CharSourceRange::getTokenRange(loc, loc), SM,
-                               C.getLangOpts()).str();
-  }
-  J::Value discover(TranslationUnitDecl *unit) {
-    J::Array entries;
-    unsigned functions = 0;
-    for (auto *decl : unit->decls()) {
-      auto *f = dyn_cast<FunctionDecl>(decl);
-      if (!f || !f->doesThisDeclarationHaveABody() ||
-          !SM.isWrittenInMainFile(SM.getExpansionLoc(f->getLocation())))
-        continue;
-      ++functions;
-      std::string name = f->getNameAsString(), m = macroAt(f->getBeginLoc());
-      std::string framework;
-      bool harness = m == "TEST" || m == "TEST_F" || m == "TEST_SIGNAL" ||
-                     m == "TEST_F_SIGNAL" || m == "TEST_F_TIMEOUT";
-      if (harness && name.rfind("wrapper_", 0) != 0 &&
-          name.rfind("_register_", 0) != 0)
-        framework = "kselftest_harness";
-      else if (name == "main" && m != "TEST_HARNESS_MAIN")
-        framework = "main";
-      else {
-        auto file = SM.getFilename(SM.getExpansionLoc(f->getLocation()));
-        if (file.contains("/bpf/prog_tests/") &&
-            (name.rfind("test_", 0) == 0 || name.rfind("serial_test_", 0) == 0) &&
-            f->getNumParams() == 0 && f->getReturnType()->isVoidType())
-          framework = "bpf_test_progs";
-      }
-      if (!framework.empty())
-        entries.push_back(J::Object{{"function", name}, {"framework", framework},
-                                   {"macro", m}, {"source", location(f->getLocation())},
-                                   {"discovery", "clang_ast"}});
-    }
-    return J::Object{{"schema_version", 2}, {"entries", std::move(entries)},
-                     {"functions_in_main_file", functions},
-                     {"target", C.getTargetInfo().getTriple().str()},
-                     {"scope", "Active preprocessor configuration only; fixture variants are not expanded."}};
-  }
   J::Value location(SourceLocation loc) {
     auto p = SM.getPresumedLoc(SM.getExpansionLoc(loc));
     if (p.isInvalid())
@@ -322,8 +400,9 @@ public:
                                 C.getLangOpts())
         .str();
   }
-  void warn(const Stmt *, std::string) {
-    testIncomplete = true;
+  void warn(const Stmt *, std::string reason) {
+    analysisIncomplete = true;
+    incompleteReasons.insert(std::move(reason));
   }
   V zero(QualType t) {
     if (auto *a = C.getAsConstantArrayType(t)) {
@@ -614,10 +693,13 @@ public:
         syscallName.erase(0, 5);
       else if (syscallName.rfind("SYS_", 0) == 0)
         syscallName.erase(0, 4);
-      else
-        syscallName = "number:" + (args[0].kind == V::Integer
-                                       ? std::to_string(args[0].number)
-                                       : "unknown");
+      else if (args[0].kind == V::Integer) {
+        auto known = SyscallNames.find(args[0].number);
+        syscallName = known == SyscallNames.end()
+                          ? "number:" + std::to_string(args[0].number)
+                          : known->second;
+      } else
+        syscallName = "number:unknown";
       int id = calls.size();
       std::vector<V> inputs;
       for (unsigned i = 1; i < args.size(); i++)
@@ -666,35 +748,30 @@ public:
         calls[id].observations.push_back({pred, s.guards});
   }
   bool assertion(const DoStmt *d, State &s, std::string m) {
-    if (m.rfind("EXPECT_", 0) != 0 && m.rfind("ASSERT_", 0) != 0)
-      return false;
-    std::string suffix = m.substr(m.find('_') + 1), op;
-    if (suffix == "EQ")
-      op = "==";
-    else if (suffix == "NE")
-      op = "!=";
-    else if (suffix == "GE")
-      op = ">=";
-    else if (suffix == "GT")
-      op = ">";
-    else if (suffix == "LE")
-      op = "<=";
-    else if (suffix == "LT")
-      op = "<";
-    else if (suffix == "TRUE")
-      op = "!=";
-    else if (suffix == "FALSE")
-      op = "==";
-    else {
-      warn(d, "unsupported assertion macro:" + m);
-      return true;
+    bool namedAssertion = m.rfind("EXPECT_", 0) == 0 ||
+                          m.rfind("ASSERT_", 0) == 0;
+    std::string op;
+    if (namedAssertion) {
+      std::string suffix = m.substr(m.find('_') + 1);
+      if (suffix == "EQ") op = "==";
+      else if (suffix == "NE") op = "!=";
+      else if (suffix == "GE") op = ">=";
+      else if (suffix == "GT") op = ">";
+      else if (suffix == "LE") op = "<=";
+      else if (suffix == "LT") op = "<";
+      else if (suffix == "TRUE") op = "!=";
+      else if (suffix == "FALSE") op = "==";
+      else {
+        warn(d, "unsupported assertion macro:" + m);
+        return true;
+      }
     }
     auto *body = dyn_cast<CompoundStmt>(d->getBody());
     if (!body)
       return false;
     V a = V::unknown("assertion operand"), b = a;
     bool haveA = false, haveB = false;
-    for (auto *stmt : body->body())
+    for (auto *stmt : body->body()) {
       if (auto *ds = dyn_cast<DeclStmt>(stmt))
         for (auto *decl : ds->decls())
           if (auto *v = dyn_cast<VarDecl>(decl)) {
@@ -707,8 +784,25 @@ public:
               haveB = true;
             }
           }
+      if (op.empty())
+        if (auto *branch = dyn_cast<IfStmt>(stmt)) {
+          const Expr *condition = branch->getCond()->IgnoreParenImpCasts();
+          if (auto *negation = dyn_cast<UnaryOperator>(condition))
+            if (negation->getOpcode() == UO_LNot)
+              condition = negation->getSubExpr()->IgnoreParenImpCasts();
+          if (auto *comparison = dyn_cast<BinaryOperator>(condition))
+            if (comparison->isComparisonOp())
+              op = comparison->getOpcodeStr().str();
+        }
+    }
     if (!haveA || !haveB) {
+      if (!namedAssertion)
+        return false;
       warn(d, "unrecognized assertion expansion");
+      return true;
+    }
+    if (op.empty()) {
+      warn(d, "assertion comparison was not recovered");
       return true;
     }
     observation(op, a, b, s);
@@ -734,12 +828,19 @@ public:
     std::string m = macro(stmt);
     if (m == "TH_LOG")
       return {}; // Diagnostic macro; assertions handle their own failure path.
-    if (auto *d = dyn_cast<DoStmt>(stmt))
+    if (auto *d = dyn_cast<DoStmt>(stmt)) {
       if (assertion(d, s, m))
         return {};
-    if (isa<ForStmt>(stmt) &&
-        (m.rfind("EXPECT_", 0) == 0 || m.rfind("ASSERT_", 0) == 0))
-      return {}; // optional failure handler
+      std::string text = source(d);
+      if (text.find("fprintf") != std::string::npos &&
+          text.find("# %s:%d:%s:") != std::string::npos)
+        return {}; // Expanded diagnostic-only TH_LOG block.
+    }
+    if (auto *loop = dyn_cast<ForStmt>(stmt))
+      if ((m.rfind("EXPECT_", 0) == 0 || m.rfind("ASSERT_", 0) == 0) ||
+          (loop->getInc() && source(loop->getInc()).find("__bail") !=
+                                 std::string::npos))
+        return {}; // optional assertion failure handler
     if (m == "SKIP")
       return {Skipped, {}};
     if (auto *body = dyn_cast<CompoundStmt>(stmt)) {
@@ -918,55 +1019,113 @@ public:
   static J::Object constraintJson(const Constraint &constraint) {
     return J::Object{{"op", constraint.op}, {"value", constraint.value}};
   }
+  std::optional<J::Value> record(const Invocation &call) {
+    if (!Syscalls.empty() &&
+        std::find(Syscalls.begin(), Syscalls.end(), call.name) == Syscalls.end())
+      return std::nullopt;
+    if (call.observations.empty() || !call.complete ||
+        std::any_of(call.args.begin(), call.args.end(),
+                    [](const V &v) { return !concrete(v); }))
+      return std::nullopt;
+    auto result = finalResult(call);
+    if (!result)
+      return std::nullopt;
+    J::Array args;
+    for (auto &v : call.args)
+      args.push_back(json(v));
+    J::Object constraints;
+    if (result->ret)
+      constraints["ret"] = constraintJson(*result->ret);
+    if (result->error)
+      constraints["errno"] = constraintJson(*result->error);
+    return J::Object{{"syscall", call.name},
+                     {"args", std::move(args)},
+                     {"result", std::move(constraints)}};
+  }
+  bool fromPrimarySource(const FunctionDecl *function) {
+    if (PrimarySource.empty())
+      return SM.isWrittenInMainFile(SM.getExpansionLoc(function->getLocation()));
+    auto location = SM.getPresumedLoc(SM.getExpansionLoc(function->getLocation()));
+    return location.isValid() && PrimarySource == location.getFilename();
+  }
+  void analyze(const FunctionDecl *function) {
+    calls.clear();
+    analysisIncomplete = false;
+    incompleteReasons.clear();
+    State state;
+    for (auto *parameter : function->parameters())
+      state.env[parameter] =
+          V::unknown("function parameter:" + parameter->getNameAsString());
+    execute(function->getBody(), state);
+    for (auto &call : calls)
+      call.complete = !analysisIncomplete;
+
+    unsigned count = 0;
+    for (auto &call : calls) {
+      auto value = record(call);
+      if (!value)
+        continue;
+      ++count;
+      std::string key = llvm::formatv("{0}", *value).str();
+      if (seenRecords.insert(key).second)
+        records.push_back(std::move(*value));
+    }
+    J::Object result{{"function", function->getNameAsString()},
+                     {"source", location(function->getLocation())},
+                     {"invocation_count", calls.size()},
+                     {"record_count", count}};
+    if (analysisIncomplete) {
+      result["status"] = "unsupported";
+      result["reason"] = "unsupported_construct";
+      J::Array reasons;
+      for (auto &reason : incompleteReasons)
+        reasons.push_back(reason);
+      result["reasons"] = std::move(reasons);
+    } else if (count) {
+      result["status"] = "extracted";
+    } else {
+      result["status"] = "no_records";
+      result["reason"] = "no_concrete_normalized_records";
+    }
+    functions.push_back(std::move(result));
+  }
   void run(TranslationUnitDecl *unit) {
     for (auto *decl : unit->decls())
       if (auto *f = dyn_cast<FunctionDecl>(decl))
         if (f->doesThisDeclarationHaveABody())
           definitions[f->getNameAsString()] = f;
+
+    if (AllFunctions)
+      for (auto *decl : unit->decls())
+        if (auto *function = dyn_cast<FunctionDecl>(decl))
+          if (function->doesThisDeclarationHaveABody() &&
+              !function->getName().empty() && fromPrimarySource(function))
+            analyze(function);
+
     for (auto &name : Functions) {
-      auto it = definitions.find(name);
-      if (it == definitions.end())
+      auto found = definitions.find(name);
+      if (found != definitions.end()) {
+        analyze(found->second);
         continue;
-      testIncomplete = false;
-      size_t begin = calls.size();
-      State state;
-      for (auto *p : it->second->parameters())
-        state.env[p] = V::unknown("test parameter:" + p->getNameAsString());
-      execute(it->second->getBody(), state);
-      for (size_t i = begin; i < calls.size(); i++)
-        calls[i].complete = !testIncomplete;
+      }
+      functions.push_back(J::Object{{"function", name},
+                                    {"status", "unsupported"},
+                                    {"reason", "function_not_found"},
+                                    {"record_count", 0}});
     }
   }
   J::Value output() {
-    J::Array records;
-    std::set<std::string> seen;
-    for (auto &c : calls) {
-      if (!Syscalls.empty() &&
-          std::find(Syscalls.begin(), Syscalls.end(), c.name) == Syscalls.end())
-        continue;
-      if (c.observations.empty() || !c.complete ||
-          std::any_of(c.args.begin(), c.args.end(),
-                      [](const V &v) { return !concrete(v); }))
-        continue;
-      auto result = finalResult(c);
-      if (!result)
-        continue;
-      J::Array args;
-      for (auto &v : c.args)
-        args.push_back(json(v));
-      J::Object constraints;
-      if (result->ret)
-        constraints["ret"] = constraintJson(*result->ret);
-      if (result->error)
-        constraints["errno"] = constraintJson(*result->error);
-      J::Value record = J::Object{{"syscall", c.name},
-                                  {"args", std::move(args)},
-                                  {"result", std::move(constraints)}};
-      std::string key = llvm::formatv("{0}", record).str();
-      if (seen.insert(key).second)
-        records.push_back(std::move(record));
-    }
-    return J::Object{{"records", std::move(records)}};
+    J::Array warnings;
+    for (auto &warning : StartupWarnings)
+      warnings.push_back(warning);
+    return J::Object{{"schema_version", 1},
+                     {"artifact", InputFile.getValue()},
+                     {"source", PrimarySource},
+                     {"target", C.getTargetInfo().getTriple().str()},
+                     {"target_source", TargetOrigin},
+                     {"warnings", std::move(warnings)},
+                     {"functions", std::move(functions)},
+                     {"records", std::move(records)}};
   }
 };
 
@@ -974,10 +1133,6 @@ class Consumer : public ASTConsumer {
 public:
   void HandleTranslationUnit(ASTContext &context) override {
     Extractor extractor(context);
-    if (Discover) {
-      llvm::outs() << llvm::formatv("{0:2}\n", extractor.discover(context.getTranslationUnitDecl()));
-      return;
-    }
     extractor.run(context.getTranslationUnitDecl());
     llvm::outs() << llvm::formatv("{0:2}\n", extractor.output());
   }
@@ -989,20 +1144,47 @@ class Action : public ASTFrontendAction {
   }
 };
 int main(int argc, const char **argv) {
-  auto options = tooling::CommonOptionsParser::create(argc, argv, Category);
-  if (!options) {
-    llvm::errs() << llvm::toString(options.takeError()) << "\n";
+  llvm::cl::HideUnrelatedOptions(Category);
+  llvm::cl::ParseCommandLineOptions(argc, argv);
+  if (Functions.empty() == !AllFunctions) {
+    llvm::errs() << "Specify either --all-functions or at least one --function.\n";
     return 2;
   }
-  if (Functions.empty() && !Discover) {
-    llvm::errs() << "Specify at least one --function.\n";
+  llvm::StringRef extension = llvm::sys::path::extension(InputFile);
+  if (extension != ".i" && extension != ".ii") {
+    llvm::errs() << "Input must be a preprocessed .i or .ii file.\n";
     return 2;
   }
-  if (options->getSourcePathList().size() != 1) {
-    llvm::errs() << "Analyze one translation unit per invocation.\n";
+
+  if (!SourceFile.empty())
+    PrimarySource = SourceFile;
+  if (!inspectPreprocessedInput(InputFile))
     return 2;
+
+  std::string effectiveTarget = Target;
+  if (!effectiveTarget.empty()) {
+    TargetOrigin = "explicit";
+  } else {
+    llvm::SmallString<256> bitcodePath;
+    if (!Bitcode.empty())
+      bitcodePath = Bitcode;
+    else {
+      bitcodePath = InputFile;
+      llvm::sys::path::replace_extension(bitcodePath, ".bc");
+    }
+    if (!bitcodePath.empty() && llvm::sys::fs::exists(bitcodePath))
+      if (auto inferred = bitcodeTarget(bitcodePath)) {
+        effectiveTarget = *inferred;
+        TargetOrigin = "bitcode";
+      }
   }
-  tooling::ClangTool tool(options->getCompilations(),
-                          options->getSourcePathList());
+
+  std::vector<std::string> clangArguments{
+      "-fsyntax-only", "-Wno-everything", "-x",
+      extension == ".ii" ? "c++-cpp-output" : "cpp-output"};
+  if (!effectiveTarget.empty())
+    clangArguments.push_back("--target=" + effectiveTarget);
+  tooling::FixedCompilationDatabase compilations(".", clangArguments);
+  tooling::ClangTool tool(compilations, {InputFile});
   return tool.run(tooling::newFrontendActionFactory<Action>().get());
 }

@@ -1,150 +1,158 @@
 # syscall-static-extractor
 
-一个基于 Clang LibTooling 的小型静态分析原型：从 Linux kselftest 的 C AST 中关联 syscall 参数和结果断言。
-分析的是未修改的测试源文件。分析时不运行 syscall、不运行 selftests、不构建内核或 syz-executor。
+一个基于 Clang AST 的静态 syscall 场景提取器。它从目标项目真实构建留下的预处理翻译单元中，关联 syscall 参数和 `ret` / `errno` 断言。
 
-## 使用
+本仓库不构建目标项目，不推导 Makefile，不查找目标项目头文件，也不运行被分析程序。Clang 只把已经预处理的 `.i/.ii` 文本解析成内存 AST；不再执行预处理、代码生成或链接。
 
-本机需要 CMake、C++ 编译器、LLVM/Clang 开发库和 Python 3；Python 无第三方依赖。
-本次开发环境为 LLVM/Clang 21，目标 x86_64 Linux。
+## 构建分析器
+
+需要 CMake、C++ 编译器和 LLVM/Clang 开发库。本次开发和验证使用 LLVM/Clang 21。
 
 ```sh
-python3 build.py
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
+  -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
+cmake --build build -j2
 python3 -m unittest discover -s tests -v
-python3 run_demo.py --kernel /home/hengyul/linux
 ```
 
-结果：`out/dataset.json`（仅含 syscall、参数和结果约束）、`out/report.md`（相同内容的表格）。
-如果源码目录不同，运行测试前设置任务专用环境变量 `LINUX_SOURCE`。
-可以通过 `SYSCALL_EXTRACTOR` 指定已有的提取器二进制。
+LLVM 安装路径不同时，按 `llvm-config --cmakedir` 的结果调整两个 CMake 路径。
 
-直接分析单个函数：
+## 在目标项目中准备 artifact
+
+目标项目必须使用 Clang，并在自己的完整构建命令中加入：
+
+```text
+-save-temps=obj
+```
+
+建议同时加入 `-dD`：
+
+```text
+-save-temps=obj -dD
+```
+
+示意命令：
+
+```sh
+make CC=clang CXX=clang++ \
+  CFLAGS+=' -save-temps=obj -dD' \
+  CXXFLAGS+=' -save-temps=obj -dD'
+```
+
+具体变量由目标项目决定；使用 `HOSTCC`、BPF 编译参数或其他编译器变量的项目，需要把参数传给对应的 Clang 调用。推荐使用目标项目自己的独立输出目录。
+
+正常编译会留下：
+
+| 后缀 | 内容 | 本仓库用途 |
+|---|---|---|
+| `.i` | 预处理后的 C | 主要输入 |
+| `.ii` | 预处理后的 C++ | 主要输入 |
+| `.bc` | LLVM bitcode | 可选；自动读取 target triple |
+| `.s` | 汇编 | 忽略 |
+| `.o` | 目标文件 | 忽略；供目标项目正常链接 |
+
+普通 `.i` 中 `__NR_openat2` 已经展开成数字，因此记录会使用 `number:437`。`-dD` 会在 `.i` 中保留宏定义，分析器可自动把纯整数形式的 `__NR_*` 映射回 syscall 名称。没有 `-dD` 仍然可以分析。
+
+若需要完整覆盖，应进行一次干净的完整构建。增量构建目录只能代表本次实际重新编译的翻译单元；不同配置也必须使用不同输出路径，避免中间文件相互覆盖。
+
+## 分析单个翻译单元
+
+分析指定函数：
 
 ```sh
 build/syscall-extract \
-  --function=flags_set --syscall=pidfd_getfd \
-  /home/hengyul/linux/tools/testing/selftests/pidfd/pidfd_getfd_test.c \
-  -- -std=gnu11 \
-  -I/home/hengyul/linux/tools/testing/selftests \
-  -I/home/hengyul/linux/tools/include
+  --function=openat2_flag_validation \
+  /path/to/build/openat2_test.i
 ```
 
-## 扫描整个 Linux selftests
+分析原始源文件中定义的所有函数：
 
 ```sh
-python3 scan_selftests.py --kernel /home/hengyul/linux --jobs 4
+build/syscall-extract --all-functions /path/to/build/openat2_test.i
 ```
 
-默认输出到一个新的 `out/scan-时间戳/` 目录，不覆盖已有扫描结果。
-整个目录的文件都会进入清单；对 C 文件解析当前编译配置的 AST，自动发现 `TEST`、`TEST_F`、
-`TEST_SIGNAL`、`TEST_F_SIGNAL`、`TEST_F_TIMEOUT`、普通 `main` 和 BPF prog_tests 的命名入口。
-宏展开产生的注册函数和 wrapper 不会当作独立用例。
+常用选项：
 
-可指定已有的编译数据库、额外参数、扫描范围及资源预算：
+```text
+--function=NAME       指定入口；可重复
+--all-functions       分析原始源文件中的全部函数
+--syscall=NAME        只输出指定 syscall；可重复
+--target=TRIPLE       覆盖目标架构
+--bitcode=FILE.bc     指定用于读取 target 的 bitcode
+--source-file=PATH    覆盖从 #line 标记识别的原始源码路径
+--loop-limit=N        有限循环最大展开次数
+```
+
+`--function` 和 `--all-functions` 二选一。同目录同名 `.bc` 存在时会自动读取其中的 target triple；否则使用本机 target，并在输出中标明 `target_source`。
+
+分析器利用 `.i/.ii` 中的 `#line` 标记识别原始源文件。`--all-functions` 不会把展开进来的系统头文件函数作为入口，也不依赖 `TEST`、`TEST_F`、BPF `test_*` 等仓库专用命名规则。
+
+## 批量扫描 artifact
 
 ```sh
-python3 scan_selftests.py \
-  --kernel /home/hengyul/linux \
-  --compile-commands /path/to/compile_commands.json \
-  --extra-arg=-I/path/to/generated/headers \
-  --jobs 4 --timeout 10 --memory-mb 768 --output-mb 16
-
-python3 scan_selftests.py --kernel /home/hengyul/linux \
-  --include 'pidfd/*.c' --include 'filesystems/openat2/*.c'
+python3 scan_artifacts.py /path/to/target-build-output \
+  --jobs 4 \
+  --timeout 20 \
+  --memory-mb 1024
 ```
 
-`--compile-commands` 和 `--include` 均可重复。编译数据库保留同一源文件的多条不同构建配置；
-未提供时自动查找内核根目录的 `compile_commands.json`。
-缺少编译记录的文件会读取最近的 Makefile 及其可解析的 include，支持简单赋值、变量引用、条件和目标专用 CFLAGS。
-Makefile 推导标记为 `best_effort_static_make`，无法解析的表达式和缺失头文件会写入配置警告。
-不会运行 Makefile、`$(shell ...)`、构建命令或生成头文件。成功通过 C 解析不表示推导参数与实际构建完全相同。
-跨架构目录会根据目录推断目标 triple；需要相应 sysroot/头文件才能成功解析，缺失时明确报告 `parse_failed`。
-BPF 内核程序使用 `BPF_CFLAGS` / `CLANG_CFLAGS` 和 BPF 目标，与宿主机测试驱动的 CFLAGS 分开处理。
-可用 `--target` 指定 Makefile 回退配置的目标。
+可指定扫描范围和过滤条件：
 
-每个发现/分析子进程默认最多 10 秒、768 MiB 地址空间、16 MiB 单个输出文件，且禁止生成 core dump。
-超时、内存不足、输出超限或分析器崩溃只影响相应用例，其他文件继续扫描。
-`--memory-mb` 是进程地址空间上限，不是 RSS；`--jobs` 控制并发进程数。
+```sh
+python3 scan_artifacts.py /path/to/artifacts \
+  --include 'openat2/*.i' \
+  --syscall openat2 \
+  --target x86_64-linux-gnu \
+  --output /path/to/new-output
+```
 
-扫描输出：
+输出目录必须不存在，并且不能位于 artifact 输入树内。默认创建 `out/scan-时间戳/`。
 
 | 文件 | 内容 |
 |---|---|
-| `inventory.json` | 本次范围内的完整文件清单 |
-| `summary.json` / `report.md` | 机器可读汇总 / 可读覆盖报告 |
-| `files.jsonl` | 逐文件状态、参数来源、配置警告和用例信息 |
-| `tests.jsonl` | 逐入口/配置状态及明确原因 |
-| `records.jsonl` | 去重后的 syscall 输入和最终 `ret` / `errno` 约束 |
-| `artifacts/` | 逐文件发现结果、逐用例精简结果和编译诊断 |
+| `records.jsonl` | 全局去重后的 syscall 参数和结果约束 |
+| `artifacts.jsonl` | 每个 `.i/.ii` 的 target、状态、警告和日志位置 |
+| `functions.jsonl` | 每个原始源码函数的状态和记录数 |
+| `summary.json` | 扫描范围、资源预算和状态计数 |
+| `artifacts/` | 每个分析进程的完整有界 stdout/stderr |
 
-状态解释：
+状态含义：
 
 | 状态 | 含义 |
 |---|---|
-| `extracted` | 至少提取到一条具体且可规范化的记录 |
-| `partial` | 同一文件的不同入口或配置同时存在提取结果和失败状态 |
-| `unsupported` | 不支持该语言/结构，或没有可识别入口/可关联的 syscall 断言 |
-| `parse_failed` | 编译参数、头文件或 C 语法等导致解析失败 |
-| `resource_limit` | 时间、地址空间、输出大小或循环展开预算耗尽 |
-| `analysis_failed` | 分析器崩溃、输出损坏或扫描器内部异常 |
-| `not_applicable` | 头文件/资源文件，或入口没有具体且可规范化的记录 |
-| `inactive_configuration` | 文本中存在的候选入口不在当前预处理配置的 AST 中 |
+| `extracted` | 至少提取到一条具体、可规范化记录 |
+| `no_records` | 解析成功，但没有具体记录 |
+| `unsupported` | 函数包含当前求值器不支持的控制流或表达式 |
+| `parse_failed` | `.i/.ii` 无法重新建立 AST |
+| `resource_limit` | 超时、地址空间或输出大小超限 |
+| `analysis_failed` | 分析器崩溃、异常退出或输出损坏 |
 
-解析失败时仍会保留词法发现的候选用例；候选不是 AST 证明的入口。
-未识别入口时生成 `<entry-discovery>` 占位项，避免把无输出误报为成功。
-脚本、汇编等会得到文件级“不支持”状态，内部测试函数暂不枚举。
-fixture variant 的组合、未知自定义测试框架和未提供的其他构建配置尚不保证完整枚举。
-无法形成具体参数和规范结果约束的调用不会进入 `records.jsonl`。
+批量扫描以翻译单元为隔离单位：每个 `.i/.ii` 只建立一次 AST，再分析其中全部候选函数。一个翻译单元失败不会中止其他任务。
 
-只列出一个文件中当前配置下的测试入口：
+## 数据语义
 
-```sh
-build/syscall-extract --discover \
-  /home/hengyul/linux/tools/testing/selftests/filesystems/openat2/openat2_test.c \
-  -- -I/home/hengyul/linux/tools/testing/selftests -I/home/hengyul/linux/tools/include
+每条最终记录只包含：
+
+```json
+{
+  "syscall": "openat2",
+  "args": [-100, ".", {"pointee": {"flags": 0, "mode": 0, "resolve": 0}}, 24],
+  "result": {"ret": {"op": ">=", "value": 0}}
+}
 ```
 
-## 当前验证范围
+结果来自源码中可关联的断言，不是内核行为证明。未知参数、分析不完整、断言无法规范化或结果约束冲突的调用不会进入 `records.jsonl`。
 
-- `pidfd_getfd_test.c` 的 `flags_set`：常量参数和 `ret` / `errno` 配对。
-- `openat2_test.c` 的 `openat2_flag_validation`：25 行结构体参数表、零初始化、字段访问、有限循环、条件分支。
-- 从真实函数体识别 `return syscall(...)` 和 `ret >= 0 ? ret : -errno` 包装。
-- `EXPECT/ASSERT_EQ/NE/GE/GT/LE/LT/TRUE/FALSE` 的实际宏展开。
-- 将可归约的当前调用条件合并进最终结果，成功返回值保留为 `ret >= 0`。
-- 未知外部调用会使 errno 来源失效，并使其指针参数指向的内容变为未知。
+当前求值器支持常量、局部符号状态、结构体和数组初始化、有限循环、简单分支、少量直线 wrapper，以及展开后的常见 `EXPECT` / `ASSERT` 结构。它不支持任意循环、并发、一般跨函数控制流或 syscall 输出内存推导。
 
-原有 demo 的真实源码提取结果为 26 条记录：pidfd_getfd 1 条；openat2 25 条（20 条 EINVAL、5 条返回非负 fd）。
-回归及集成检查共 30 项：原有 13 项覆盖条件断言、errno 来源、参数表配对、未知值、指针写入、无符号宽整数和分析范围限制；
-新增 17 项覆盖全目录清单、AST 入口发现、编译参数来源、不执行 Makefile 命令、状态分类和资源隔离。
-
-提取器使用结构化 AST 遍历、常量求值、局部符号状态、有限循环展开和简单函数内联。
-没有使用正则表达式硬编码测试表内容，也没有执行测试来取得标签。
-
-## 数据含义和限制
-
-每条记录只包含 `syscall`、`args` 和 `result`。`result` 将源码中的相关断言合并为
-`ret` / `errno` 约束；Python 输出层为已知 errno 数值增加 `EINVAL` 等名称。
-未知参数、分析不完整、断言无法规范化或结果约束互相冲突的记录会被过滤。
-路径、源码位置、调用前缀、fixture、wrapper、原始谓词和分析诊断不进入结果。
-记录是从测试断言恢复的输入/结果场景，不是内核行为证明，也不保证脱离测试环境后可独立复现。
-
-这不是完备或经过形式化验证的 C 分析器。它只支持明确记录的一小部分 C 语法与 kselftest 模式。
-不支持任意循环、并发、一般跨函数控制流或 syscall 输出内存推导；默认每个循环最多展开 128 次。
-未知调用和分支合并可能使输入变为未知并导致记录被过滤。循环中的未知 continue/skip 分支
-不保证穷举所有路径。可执行结果仍会受权限、资源、内核版本、配置和文件系统等影响。
-
-当前命令使用本机系统 UAPI 头文件与仓库 selftest/helper 头文件，没有生成新的内核 headers。
-跨架构使用时需显式传入正确编译参数，且不能直接采用 Python 主机的 errno 名称映射。
+普通预处理输出会丢失宏调用身份，所以核心不会判断函数原来是否由某个测试框架宏生成。批量扫描只声明覆盖输入目录中实际存在的 artifact，不声明覆盖目标仓库全部源码或全部构建配置。
 
 ## 目录
 
-- `src/main.cpp`：Clang AST 分析器。
-- `run_demo.py`：运行两个真实测试文件的分析并生成 JSON / Markdown。
-- `tests/fixtures.c`：用于检查错误关联的微型 C 输入，仅做静态分析。
-- `tests/test_extractor.py`：回归测试与真实源码集成检查。
-- `scan_selftests.py`：全目录清单、入口发现、资源隔离及覆盖报告。
-- `build_flags.py`：编译数据库读取和不执行命令的 Makefile 参数推导。
-- `limit_worker.py`：在独立进程内设置分析资源上限。
-- `tests/test_scanner.py`：扫描、参数来源、状态与资源限制测试。
-
-下一步适合扩展 `read` 等 syscall 的输出内存关联，以及更完整的 fixture 和路径分析。
+- `src/main.cpp`：预处理翻译单元的 AST 解析和符号求值核心。
+- `scan_artifacts.py`：通用 artifact 批量扫描、聚合和状态报告。
+- `limit_worker.py`：分析子进程资源限制。
+- `tests/fixtures.c`：只用于测试 artifact 生成和静态分析的微型输入。
+- `tests/`：提取、target 识别、批量扫描和资源隔离测试。
