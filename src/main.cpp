@@ -13,7 +13,9 @@
 #include <vector>
 
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/ASTTypeTraits.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/Stmt.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -121,6 +123,20 @@ struct Invocation {
   bool concrete = false;
 };
 
+struct Subject {
+  const Invocation *call = nullptr;
+  bool error = false;
+  int sign = 1;
+};
+
+struct PendingConstraint {
+  Subject subject;
+  ResultConstraint result;
+};
+
+using ConstraintClause = std::vector<PendingConstraint>;
+using Predicate = std::vector<ConstraintClause>;
+
 class Collector {
   struct EmittedRecord {
     std::string function;
@@ -134,6 +150,7 @@ class Collector {
   std::set<std::string> SelectedSyscalls;
   std::vector<std::unique_ptr<Invocation>> Invocations;
   std::vector<std::unique_ptr<ConstraintSet>> Constraints;
+  std::vector<std::unique_ptr<PendingConstraint>> PendingConstraints;
   std::set<std::string> SeenFunctions;
   std::vector<EmittedRecord> Records;
 
@@ -189,6 +206,12 @@ public:
   const ConstraintSet *makeConstraints(ConstraintSet Value) {
     Constraints.push_back(std::make_unique<ConstraintSet>(std::move(Value)));
     return Constraints.back().get();
+  }
+
+  const PendingConstraint *makePendingConstraint(PendingConstraint Value) {
+    PendingConstraints.push_back(
+        std::make_unique<PendingConstraint>(std::move(Value)));
+    return PendingConstraints.back().get();
   }
 
   void emit(const Invocation *Call, const ConstraintSet *Result) {
@@ -269,6 +292,8 @@ REGISTER_MAP_WITH_PROGRAMSTATE(SyscallBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ErrnoBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintsByCall, const Invocation *,
                                const ConstraintSet *)
+REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintByComparison, const BinaryOperator *,
+                               const PendingConstraint *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(LastSyscall, const Invocation *)
 
 static const FunctionDecl *topFunction(const LocationContext *LC) {
@@ -388,12 +413,6 @@ static std::string syscallName(const CallEvent &Call, int64_t Number,
   }
 }
 
-struct Subject {
-  const Invocation *call = nullptr;
-  bool error = false;
-  int sign = 1;
-};
-
 static int signOf(const SymExpr *Expression, SymbolRef Atom) {
   if (Expression == Atom)
     return 1;
@@ -478,6 +497,22 @@ static std::string negateComparison(std::string Op) {
   return Op;
 }
 
+static std::string negateTruth(std::string Op) {
+  if (Op == "==")
+    return "!=";
+  if (Op == "!=")
+    return "==";
+  if (Op == "<")
+    return ">=";
+  if (Op == "<=")
+    return ">";
+  if (Op == ">")
+    return "<=";
+  if (Op == ">=")
+    return "<";
+  return {};
+}
+
 static bool errnoConstraintHasPositiveSolution(const ResultConstraint &C) {
   if (C.op == "==")
     return C.value > 0;
@@ -499,6 +534,267 @@ static bool expectationVariable(const Expr *E) {
   return Name == "__exp" || Name == "__seen";
 }
 
+static SVal currentValue(const Expr *Expression, CheckerContext &C) {
+  SVal Value = C.getSVal(Expression);
+  if (!Value.isUnknown())
+    return Value;
+  const auto *Ref = dyn_cast_or_null<DeclRefExpr>(ignoreExpr(Expression));
+  const auto *Variable = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+  if (!Variable)
+    return Value;
+  Loc Location = C.getState()->getLValue(Variable, C.getLocationContext());
+  return C.getState()->getSVal(Location, Variable->getType());
+}
+
+static std::optional<llvm::APSInt>
+concreteInteger(const Expr *Expression, SVal Value, CheckerContext &C) {
+  if (const llvm::APSInt *Integer = Value.getAsInteger())
+    return *Integer;
+  Expr::EvalResult Result;
+  if (Expression->EvaluateAsInt(Result, C.getASTContext()))
+    return Result.Val.getInt();
+  return std::nullopt;
+}
+
+static std::optional<PendingConstraint>
+extractComparison(const BinaryOperator *Compare, CheckerContext &C) {
+  if (!Compare || !Compare->isComparisonOp())
+    return std::nullopt;
+  SVal LHS = currentValue(Compare->getLHS(), C);
+  SVal RHS = currentValue(Compare->getRHS(), C);
+  auto LeftSubject = findSubject(LHS, C.getState());
+  auto RightSubject = findSubject(RHS, C.getState());
+  auto LeftInteger = concreteInteger(Compare->getLHS(), LHS, C);
+  auto RightInteger = concreteInteger(Compare->getRHS(), RHS, C);
+  Subject S;
+  std::optional<llvm::APSInt> Integer;
+  std::string Op;
+  if (LeftSubject && RightInteger) {
+    S = *LeftSubject;
+    Integer = RightInteger;
+    Op = directComparison(Compare->getOpcode());
+  } else if (RightSubject && LeftInteger) {
+    S = *RightSubject;
+    Integer = LeftInteger;
+    Op = reversedComparison(Compare->getOpcode());
+  } else {
+    return std::nullopt;
+  }
+  if (!Integer || Integer->getBitWidth() > 64 || Op.empty())
+    return std::nullopt;
+  int64_t Value = Integer->getSExtValue();
+  if (S.sign < 0) {
+    if (Value == INT64_MIN)
+      return std::nullopt;
+    Value = -Value;
+    Op = negateComparison(std::move(Op));
+  }
+  return PendingConstraint{S, ResultConstraint{std::move(Op), Value}};
+}
+
+static std::optional<Predicate> andPredicate(const Predicate &LHS,
+                                             const Predicate &RHS) {
+  Predicate Result;
+  if (LHS.empty() || RHS.empty())
+    return Result;
+  for (const ConstraintClause &Left : LHS) {
+    for (const ConstraintClause &Right : RHS) {
+      if (Result.size() >= 16)
+        return std::nullopt;
+      ConstraintClause Combined = Left;
+      Combined.insert(Combined.end(), Right.begin(), Right.end());
+      Result.push_back(std::move(Combined));
+    }
+  }
+  return Result;
+}
+
+static std::optional<Predicate> orPredicate(const Predicate &LHS,
+                                            const Predicate &RHS) {
+  if (LHS.size() + RHS.size() > 16)
+    return std::nullopt;
+  Predicate Result = LHS;
+  Result.insert(Result.end(), RHS.begin(), RHS.end());
+  return Result;
+}
+
+static std::optional<Predicate>
+extractPredicate(const Expr *Expression, bool Expected, CheckerContext &C,
+                 std::set<const VarDecl *> &Resolving, unsigned Depth = 0) {
+  if (!Expression || Depth > 24)
+    return std::nullopt;
+  Expression = ignoreExpr(Expression);
+
+  if (const auto *Not = dyn_cast<UnaryOperator>(Expression)) {
+    if (Not->getOpcode() == UO_LNot)
+      return extractPredicate(Not->getSubExpr(), !Expected, C, Resolving,
+                              Depth + 1);
+  }
+
+  if (const auto *Logical = dyn_cast<BinaryOperator>(Expression)) {
+    if (Logical->getOpcode() == BO_LAnd || Logical->getOpcode() == BO_LOr) {
+      auto Left = extractPredicate(Logical->getLHS(), Expected, C, Resolving,
+                                   Depth + 1);
+      auto Right = extractPredicate(Logical->getRHS(), Expected, C, Resolving,
+                                    Depth + 1);
+      if (!Left || !Right)
+        return std::nullopt;
+      bool NeedAnd = (Logical->getOpcode() == BO_LAnd) == Expected;
+      return NeedAnd ? andPredicate(*Left, *Right) : orPredicate(*Left, *Right);
+    }
+
+    if (Logical->isComparisonOp()) {
+      std::optional<PendingConstraint> Pending;
+      if (const PendingConstraint *const *Cached =
+              C.getState()->get<ConstraintByComparison>(Logical))
+        Pending = **Cached;
+      else
+        Pending = extractComparison(Logical, C);
+      if (!Pending)
+        return std::nullopt;
+      if (!Expected)
+        Pending->result.op = negateTruth(std::move(Pending->result.op));
+      if (Pending->subject.error &&
+          !errnoConstraintHasPositiveSolution(Pending->result))
+        return std::nullopt;
+      return Predicate{{std::move(*Pending)}};
+    }
+  }
+
+  if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
+    const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
+    if (Variable && Variable->hasInit() && Resolving.insert(Variable).second) {
+      auto Result = extractPredicate(Variable->getInit(), Expected, C,
+                                     Resolving, Depth + 1);
+      Resolving.erase(Variable);
+      return Result;
+    }
+  }
+
+  if (const llvm::APSInt *Integer = C.getSVal(Expression).getAsInteger()) {
+    bool Actual = Integer->getBoolValue();
+    return Actual == Expected ? Predicate{ConstraintClause{}} : Predicate{};
+  }
+  return std::nullopt;
+}
+
+static std::optional<Predicate>
+extractPredicate(const Expr *Expression, bool Expected, CheckerContext &C) {
+  std::set<const VarDecl *> Resolving;
+  return extractPredicate(Expression, Expected, C, Resolving);
+}
+
+static bool containsExpectationComparison(const Expr *Expression) {
+  Expression = ignoreExpr(Expression);
+  if (const auto *Not = dyn_cast_or_null<UnaryOperator>(Expression))
+    if (Not->getOpcode() == UO_LNot)
+      return containsExpectationComparison(Not->getSubExpr());
+  const auto *Compare = dyn_cast_or_null<BinaryOperator>(Expression);
+  return Compare && Compare->isComparisonOp() &&
+         expectationVariable(Compare->getLHS()) &&
+         expectationVariable(Compare->getRHS());
+}
+
+static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
+  const SourceManager &SM = C.getSourceManager();
+  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
+    llvm::StringRef Name =
+        Lexer::getImmediateMacroName(Location, SM, C.getLangOpts());
+    if (Name == "CHECK_OP" || Name.starts_with("EXPECT_") ||
+        Name.starts_with("ASSERT_"))
+      return true;
+    Location = SM.getImmediateMacroCallerLoc(Location);
+  }
+  return false;
+}
+
+static bool failureMacroAt(SourceLocation Location, CheckerContext &C) {
+  const SourceManager &SM = C.getSourceManager();
+  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
+    if (Lexer::getImmediateMacroName(Location, SM, C.getLangOpts()) ==
+        "KSFT_FAIL")
+      return true;
+    Location = SM.getImmediateMacroCallerLoc(Location);
+  }
+  return false;
+}
+
+static bool knownFailureCall(const CallExpr *Call) {
+  const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
+  if (!Callee)
+    return false;
+  llvm::StringRef Name = Callee->getName();
+  return Name == "abort" || Name == "__assert_fail" ||
+         Name == "ksft_exit_fail_msg" || Name == "bpf_test_failure" ||
+         Name == "nolibc_test_failure" || Name == "test__fail";
+}
+
+static bool isFailureStatement(const Stmt *Statement, CheckerContext &C) {
+  if (!Statement)
+    return false;
+  if (const auto *Return = dyn_cast<ReturnStmt>(Statement))
+    return Return->getRetValue() &&
+           failureMacroAt(Return->getRetValue()->getExprLoc(), C);
+  if (const auto *Expression = dyn_cast<Expr>(Statement))
+    return knownFailureCall(dyn_cast_or_null<CallExpr>(ignoreExpr(Expression)));
+  if (const auto *Compound = dyn_cast<CompoundStmt>(Statement)) {
+    for (const Stmt *Child : Compound->body())
+      if (isFailureStatement(Child, C))
+        return true;
+  }
+  return false;
+}
+
+static bool containsStatement(const Stmt *Root, const Stmt *Needle) {
+  if (!Root)
+    return false;
+  if (Root == Needle)
+    return true;
+  for (const Stmt *Child : Root->children())
+    if (containsStatement(Child, Needle))
+      return true;
+  return false;
+}
+
+static const IfStmt *parentIf(const DynTypedNode &Node, const Stmt *Condition,
+                              ASTContext &Context, unsigned Depth = 0) {
+  if (Depth > 12)
+    return nullptr;
+  for (const DynTypedNode &Parent : Context.getParents(Node)) {
+    if (const auto *If = Parent.get<IfStmt>())
+      if (containsStatement(If->getCond(), Condition))
+        return If;
+    if (Parent.get<Stmt>())
+      if (const IfStmt *If = parentIf(Parent, Condition, Context, Depth + 1))
+        return If;
+  }
+  return nullptr;
+}
+
+static const IfStmt *parentIf(const Stmt *Condition, CheckerContext &C) {
+  if (!Condition)
+    return nullptr;
+  return parentIf(DynTypedNode::create(*Condition), Condition,
+                  C.getASTContext());
+}
+
+static std::optional<bool> successfulCondition(const Stmt *Condition,
+                                               CheckerContext &C) {
+  const auto *Expression = dyn_cast<Expr>(Condition);
+  const IfStmt *If = parentIf(Condition, C);
+  if (!Expression || !If)
+    return std::nullopt;
+  if (isFailureStatement(If->getThen(), C))
+    return false;
+  if (isFailureStatement(If->getElse(), C))
+    return true;
+  if (containsExpectationComparison(Expression) ||
+      assertionMacroAt(If->getIfLoc(), C) ||
+      assertionMacroAt(Expression->getExprLoc(), C))
+    return false;
+  return std::nullopt;
+}
+
 static bool preservesSyscallContext(const CallEvent &Call) {
   const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
   if (!ND)
@@ -506,13 +802,63 @@ static bool preservesSyscallContext(const CallEvent &Call) {
   llvm::StringRef Name = ND->getName();
   return Name == "syscall" || Name == "__errno_location" || Name == "fprintf" ||
          Name == "printf" || Name == "snprintf" || Name == "puts" ||
-         Name == "fputs";
+         Name == "fputs" || Name == "ksft_test_result" ||
+         Name == "expect_syseq" || Name == "expect_syszr" ||
+         Name == "expect_syserr";
 }
 
 class SyscallScenarioChecker
     : public Checker<eval::Call, check::PreCall, check::PostStmt<UnaryOperator>,
-                     check::PostStmt<ImplicitCastExpr>, check::BeginFunction,
+                     check::PostStmt<ImplicitCastExpr>,
+                     check::PostStmt<BinaryOperator>, check::BeginFunction,
                      check::EndFunction, check::BranchCondition> {
+  static bool equalConstraint(const ResultConstraint &LHS,
+                              const ResultConstraint &RHS) {
+    return LHS.op == RHS.op && LHS.value == RHS.value;
+  }
+
+  static ProgramStateRef applyClause(ProgramStateRef State,
+                                     const ConstraintClause &Clause) {
+    for (const PendingConstraint &Pending : Clause) {
+      ConstraintSet Updated;
+      if (const ConstraintSet *const *Old =
+              State->get<ConstraintsByCall>(Pending.subject.call))
+        Updated = **Old;
+      std::optional<ResultConstraint> &Slot =
+          Pending.subject.error ? Updated.error : Updated.ret;
+      if (Slot && !equalConstraint(*Slot, Pending.result))
+        continue;
+      Slot = Pending.result;
+      const ConstraintSet *Stored =
+          ActiveCollector->makeConstraints(std::move(Updated));
+      State = State->set<ConstraintsByCall>(Pending.subject.call, Stored);
+    }
+    return State;
+  }
+
+  static bool applyPredicate(const Expr *Expression, bool Expected,
+                             CheckerContext &C) {
+    auto Extracted = extractPredicate(Expression, Expected, C);
+    if (!Extracted)
+      return false;
+    bool HasConstraint = false;
+    for (const ConstraintClause &Clause : *Extracted)
+      HasConstraint |= !Clause.empty();
+    if (!HasConstraint)
+      return false;
+
+    ProgramStateRef Base = C.getState();
+    if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
+      Base = Base->assume(*Value, Expected);
+      if (!Base)
+        return true;
+    }
+    for (const ConstraintClause &Clause : *Extracted)
+      if (ProgramStateRef Next = applyClause(Base, Clause))
+        C.addTransition(Next);
+    return true;
+  }
+
 public:
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
     if (!namedCall(Call, "syscall") || Call.getNumArgs() < 1)
@@ -555,11 +901,25 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+    if (namedCall(Call, "ksft_test_result") && Call.getNumArgs() > 0) {
+      if (const Expr *Condition = Call.getArgExpr(0))
+        if (applyPredicate(Condition, true, C))
+          return;
+    }
     if (preservesSyscallContext(Call))
       return;
     if (!C.getState()->get<LastSyscall>())
       return;
     C.addTransition(C.getState()->remove<LastSyscall>());
+  }
+
+  void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
+    auto Pending = extractComparison(Compare, C);
+    if (!Pending || !ActiveCollector)
+      return;
+    const PendingConstraint *Stored =
+        ActiveCollector->makePendingConstraint(std::move(*Pending));
+    C.addTransition(C.getState()->set<ConstraintByComparison>(Compare, Stored));
   }
 
   void checkPostStmt(const UnaryOperator *UO, CheckerContext &C) const {
@@ -613,63 +973,9 @@ public:
 
   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
     const auto *Expression = dyn_cast<Expr>(Condition);
-    Expression = ignoreExpr(Expression);
-    if (const auto *Not = dyn_cast_or_null<UnaryOperator>(Expression))
-      if (Not->getOpcode() == UO_LNot)
-        Expression = ignoreExpr(Not->getSubExpr());
-    const auto *Compare = dyn_cast_or_null<BinaryOperator>(Expression);
-    if (!Compare || !Compare->isComparisonOp() ||
-        !expectationVariable(Compare->getLHS()) ||
-        !expectationVariable(Compare->getRHS()))
-      return;
-
-    SVal LHS = C.getSVal(Compare->getLHS());
-    SVal RHS = C.getSVal(Compare->getRHS());
-    auto LeftSubject = findSubject(LHS, C.getState());
-    auto RightSubject = findSubject(RHS, C.getState());
-    const llvm::APSInt *LeftInteger = LHS.getAsInteger();
-    const llvm::APSInt *RightInteger = RHS.getAsInteger();
-    Subject S;
-    const llvm::APSInt *Integer = nullptr;
-    std::string Op;
-    if (LeftSubject && RightInteger) {
-      S = *LeftSubject;
-      Integer = RightInteger;
-      Op = directComparison(Compare->getOpcode());
-    } else if (RightSubject && LeftInteger) {
-      S = *RightSubject;
-      Integer = LeftInteger;
-      Op = reversedComparison(Compare->getOpcode());
-    } else {
-      return;
-    }
-    if (Integer->getBitWidth() > 64 || Op.empty())
-      return;
-    int64_t Expected = Integer->getSExtValue();
-    if (S.sign < 0) {
-      if (Expected == INT64_MIN)
-        return;
-      Expected = -Expected;
-      Op = negateComparison(std::move(Op));
-    }
-    ConstraintSet Updated;
-    if (const ConstraintSet *const *Old =
-            C.getState()->get<ConstraintsByCall>(S.call))
-      Updated = **Old;
-    ResultConstraint New{std::move(Op), Expected};
-    if (S.error && !errnoConstraintHasPositiveSolution(New))
-      return;
-    if (auto ConditionValue = C.getSVal(Compare).getAs<DefinedOrUnknownSVal>())
-      if (!C.getState()->assume(*ConditionValue, true))
-        return;
-    if (S.error)
-      Updated.error = std::move(New);
-    else
-      Updated.ret = std::move(New);
-    const ConstraintSet *Stored =
-        ActiveCollector->makeConstraints(std::move(Updated));
-    ProgramStateRef Next = C.getState()->set<ConstraintsByCall>(S.call, Stored);
-    C.addTransition(Next);
+    std::optional<bool> Expected = successfulCondition(Condition, C);
+    if (Expression && Expected)
+      applyPredicate(Expression, *Expected, C);
   }
 
   void checkEndFunction(const ReturnStmt *, CheckerContext &C) const {
