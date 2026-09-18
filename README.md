@@ -17,7 +17,7 @@ cmake -S . -B build \
   -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm \
   -DClang_DIR=/usr/lib/llvm-21/lib/cmake/clang
 cmake --build build -j2
-python3 -m unittest discover -s tests -v
+cmake --build build --target test
 ```
 
 ## 准备输入
@@ -88,7 +88,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 
 | 文件 | 内容 |
 |---|---|
-| `records.jsonl` | 提取结果以及对应的编译单元索引和源码 |
+| `records.jsonl` | 全局去重后的 `args`、`result` 和 `syscall` |
 | `units.jsonl` | 每条编译命令的状态、统计和进程日志位置 |
 | `functions.jsonl` | 每个顶层函数的状态和记录数 |
 | `summary.json` | 扫描范围、资源预算和状态汇总 |
@@ -104,7 +104,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 | `resource_limit` | 达到超时、地址空间或输出大小限制 |
 | `analysis_failed` | 分析器异常退出或输出损坏 |
 
-每条 compilation database 记录是独立隔离单元；一个单元失败不会中止其他单元。批量结果保留 `unit_index`，不会把不同配置下相同的 syscall 记录折叠掉。
+每条 compilation database 记录是独立隔离单元；一个单元失败不会中止其他单元。诊断信息保存在 `units.jsonl` 和 `functions.jsonl`，不会进入最终 records。
 
 ## 数据与正确性语义
 
@@ -135,5 +135,6 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 - `src/main.cpp`：编译数据库驱动、Static Analyzer checker 和结果收集。
 - `scan_artifacts.py`：compilation database 批量扫描、隔离和汇总。
 - `limit_worker.py`：分析子进程资源限制。
-- `tests/fixtures.c`：静态分析回归输入。
+- `tests/src/fixtures.c`：静态分析回归输入。
+- `tests/records.json`：无序严格比较的标准 records。
 - `tests/`：核心提取和批量扫描测试。

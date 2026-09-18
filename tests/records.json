@@ -1,0 +1,222 @@
+[
+  {
+    "args": [
+      -1,
+      0
+    ],
+    "result": {
+      "errno": {
+        "op": "==",
+        "value": 22
+      },
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_open"
+  },
+  {
+    "args": [
+      -100,
+      ".",
+      {
+        "pointee": {
+          "flags": 9223372036854775808,
+          "mode": 0,
+          "resolve": 0
+        }
+      },
+      24
+    ],
+    "result": {
+      "errno": {
+        "op": "==",
+        "value": 22
+      },
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "openat2"
+  },
+  {
+    "args": [
+      0,
+      0,
+      1
+    ],
+    "result": {
+      "errno": {
+        "op": "==",
+        "value": 22
+      },
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      0,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      1,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      1,
+      2,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      123,
+      1
+    ],
+    "result": {
+      "errno": {
+        "op": "==",
+        "value": 3
+      },
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_open"
+  },
+  {
+    "args": [
+      17,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      2,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      3,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      3,
+      4,
+      1
+    ],
+    "result": {
+      "errno": {
+        "op": "==",
+        "value": 22
+      },
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      4,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      456,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": ">=",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_open"
+  },
+  {
+    "args": [
+      9,
+      0,
+      1
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  }
+]

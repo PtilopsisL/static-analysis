@@ -88,13 +88,13 @@ class EndToEndTests(unittest.TestCase):
             compdb.write_text(json.dumps([
                 {
                     "directory": str(directory),
-                    "file": str(ROOT / "tests/fixtures.c"),
-                    "arguments": [CLANG, "-DCOMPDB_PIDFD=23", "-c", str(ROOT / "tests/fixtures.c"), "-o", str(directory / "fixtures-a.o")],
+                    "file": str(ROOT / "tests/src/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=23", "-c", str(ROOT / "tests/src/fixtures.c"), "-o", str(directory / "fixtures-a.o")],
                 },
                 {
                     "directory": str(directory),
-                    "file": str(ROOT / "tests/fixtures.c"),
-                    "arguments": [CLANG, "-DCOMPDB_PIDFD=31", "-c", str(ROOT / "tests/fixtures.c"), "-o", str(directory / "fixtures-b.o")],
+                    "file": str(ROOT / "tests/src/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=31", "-c", str(ROOT / "tests/src/fixtures.c"), "-o", str(directory / "fixtures-b.o")],
                 },
                 {
                     "directory": str(directory),
@@ -132,12 +132,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertTrue(any(row["function"] == "constant_error" for row in functions))
             records = [json.loads(line) for line in (output / "records.jsonl").read_text().splitlines()]
             self.assertTrue(any(record["syscall"] == "pidfd_getfd" for record in records))
-            configured = {
-                (record["unit_index"], record["args"][0])
-                for record in records
-                if record["args"] in ([23, 0, 1], [31, 0, 1])
-            }
-            self.assertEqual(configured, {(0, 23), (1, 31)})
+            self.assertTrue(all(set(record) == {"args", "result", "syscall"} for record in records))
+            configured = {tuple(record["args"]) for record in records if record["args"] in ([23, 0, 1], [31, 0, 1])}
+            self.assertEqual(configured, {(23, 0, 1), (31, 0, 1)})
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual(summary["compilation_units"], 3)
             self.assertEqual(summary["processed_units"], 3)

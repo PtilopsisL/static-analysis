@@ -189,10 +189,7 @@ def analyze_unit(index, entry, compdb, runner, analyzer_args):
         {**function, "unit_index": index, "translation_unit_source": data.get("source")}
         for function in data["functions"]
     ]
-    records = [
-        {**record, "unit_index": index, "translation_unit_source": data.get("source")}
-        for record in data["records"]
-    ]
+    records = data["records"]
     row.update(
         status=unit_status(functions),
         function_count=len(functions),
@@ -285,6 +282,7 @@ def main():
     runner = Runner(args.extractor, output, args.timeout, args.memory_mb, args.output_mb)
     unit_counts = Counter()
     function_counts = Counter()
+    seen_records = set()
     last_progress = time.monotonic()
     print(f"Compilation units: {len(selected)}; output: {output}", flush=True)
     pool = ThreadPoolExecutor(max_workers=args.jobs)
@@ -321,12 +319,16 @@ def main():
                     function_stream.write(json.dumps(function, ensure_ascii=False) + "\n")
                 function_stream.flush()
                 for record in records:
+                    key = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    if key in seen_records:
+                        continue
+                    seen_records.add(key)
                     record_stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 record_stream.flush()
 
                 summary["processed_units"] += 1
                 summary["functions"] += len(functions)
-                summary["records"] += len(records)
+                summary["records"] = len(seen_records)
                 if time.monotonic() - last_progress > 10 or summary["processed_units"] == len(selected):
                     print(
                         f"Processed {summary['processed_units']}/{len(selected)} units; "

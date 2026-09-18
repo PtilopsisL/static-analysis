@@ -250,12 +250,15 @@ public:
 
   json::Array recordJSON() {
     json::Array Result;
+    std::set<std::string> Seen;
     std::sort(Records.begin(), Records.end(),
               [](const EmittedRecord &LHS, const EmittedRecord &RHS) {
                 return LHS.fullKey < RHS.fullKey;
               });
-    for (EmittedRecord &Record : Records)
-      Result.push_back(std::move(Record.object));
+    for (EmittedRecord &Record : Records) {
+      if (Seen.insert(Record.fullKey).second)
+        Result.push_back(std::move(Record.object));
+    }
     return Result;
   }
 };

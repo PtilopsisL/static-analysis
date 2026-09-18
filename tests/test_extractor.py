@@ -26,12 +26,12 @@ class ExtractionTests(unittest.TestCase):
         cls.compdb = cls.build_dir / "compile_commands.json"
         cls.compdb.write_text(json.dumps([{
             "directory": str(cls.build_dir),
-            "file": str(ROOT / "tests/fixtures.c"),
+            "file": str(ROOT / "tests/src/fixtures.c"),
             "arguments": [
                 CLANG,
                 "-DCOMPDB_PIDFD=17",
                 "-c",
-                str(ROOT / "tests/fixtures.c"),
+                str(ROOT / "tests/src/fixtures.c"),
                 "-o",
                 str(cls.build_dir / "fixtures.o"),
             ],
@@ -61,7 +61,7 @@ class ExtractionTests(unittest.TestCase):
             "ret": {"op": "==", "value": -1},
             "errno": {"op": "==", "value": 22},
         })
-        self.assertEqual(result["source"], str(ROOT / "tests/fixtures.c"))
+        self.assertEqual(result["source"], str(ROOT / "tests/src/fixtures.c"))
         self.assertEqual(result["compilation_unit"]["index"], 0)
 
     def test_conditional_assertion_becomes_result_constraint(self):
@@ -123,7 +123,7 @@ class ExtractionTests(unittest.TestCase):
 
     def test_command_is_preserved_in_output(self):
         result = self.extract("constant_error")
-        self.assertEqual(result["compilation_unit"]["file"], str(ROOT / "tests/fixtures.c"))
+        self.assertEqual(result["compilation_unit"]["file"], str(ROOT / "tests/src/fixtures.c"))
         self.assertIn("-c", result["compilation_unit"]["command"])
 
     def test_real_command_line_defines_are_used(self):
