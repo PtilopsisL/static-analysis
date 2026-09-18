@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Artifact scanning and process-isolation regression tests."""
+"""Compilation database scanning and process-isolation regression tests."""
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scan_artifacts import Runner, artifact_status
+from scan_artifacts import Runner, unit_status
 
 EXTRACTOR = Path(os.environ.get("SYSCALL_EXTRACTOR", ROOT / "build/syscall-extract"))
 CLANG = os.environ.get("CLANG", shutil.which("clang-21") or shutil.which("clang"))
@@ -20,10 +20,10 @@ CLANG = os.environ.get("CLANG", shutil.which("clang-21") or shutil.which("clang"
 
 class StatusTests(unittest.TestCase):
     def test_extracted_wins_when_at_least_one_function_has_records(self):
-        self.assertEqual(artifact_status([{"status": "no_records"}, {"status": "extracted"}]), "extracted")
+        self.assertEqual(unit_status([{"status": "no_records"}, {"status": "extracted"}]), "extracted")
 
-    def test_unsupported_is_preserved_without_records(self):
-        self.assertEqual(artifact_status([{"status": "unsupported"}]), "unsupported")
+    def test_no_extracted_function_means_no_records(self):
+        self.assertEqual(unit_status([{"status": "no_records"}]), "no_records")
 
 
 class RunnerTests(unittest.TestCase):
@@ -35,10 +35,16 @@ class RunnerTests(unittest.TestCase):
             executable.chmod(0o700)
             output_dir = directory / "output"
             output_dir.mkdir()
-            source = directory / "source.i"
-            source.write_text('# 1 "source.c"\n')
+            source = directory / "source.c"
+            source.write_text("void source(void) {}\n")
+            compdb = directory / "compile_commands.json"
+            compdb.write_text(json.dumps([{
+                "directory": str(directory),
+                "file": str(source),
+                "arguments": ["clang", "-c", str(source)],
+            }]))
             runner = Runner(executable, output_dir, timeout, memory, output)
-            return runner.run(source, output_dir / "artifact")
+            return runner.run(compdb, 0, output_dir / "unit")
 
     def test_timeout_is_classified(self):
         metadata, data = self.run_fake("import time\ntime.sleep(5)\n", timeout=0.15)
@@ -76,31 +82,33 @@ class EndToEndTests(unittest.TestCase):
             self.skipTest("built extractor and clang are required")
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            artifacts = directory / "artifacts"
-            artifacts.mkdir()
-            subprocess.run(
-                [
-                    CLANG,
-                    "-save-temps=obj",
-                    "-dD",
-                    "-c",
-                    str(ROOT / "tests/fixtures.c"),
-                    "-o",
-                    str(artifacts / "fixtures.o"),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            (artifacts / "broken.i").write_text('# 1 "broken.c"\nthis is not valid C;\n')
-            (artifacts / "ignored.txt").write_text("not an artifact\n")
+            broken = directory / "broken.c"
+            broken.write_text("this is not valid C;\n")
+            compdb = directory / "compile_commands.json"
+            compdb.write_text(json.dumps([
+                {
+                    "directory": str(directory),
+                    "file": str(ROOT / "tests/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=23", "-c", str(ROOT / "tests/fixtures.c"), "-o", str(directory / "fixtures-a.o")],
+                },
+                {
+                    "directory": str(directory),
+                    "file": str(ROOT / "tests/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=31", "-c", str(ROOT / "tests/fixtures.c"), "-o", str(directory / "fixtures-b.o")],
+                },
+                {
+                    "directory": str(directory),
+                    "file": str(broken),
+                    "arguments": [CLANG, "-c", str(broken), "-o", str(directory / "broken.o")],
+                },
+            ]))
             output = directory / "scan"
             result = subprocess.run(
                 [
                     sys.executable,
                     "-B",
                     str(ROOT / "scan_artifacts.py"),
-                    str(artifacts),
+                    str(compdb),
                     "--extractor",
                     str(EXTRACTOR),
                     "--output",
@@ -113,21 +121,27 @@ class EndToEndTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = {
-                row["path"]: row
-                for row in map(json.loads, (output / "artifacts.jsonl").read_text().splitlines())
+                row["index"]: row
+                for row in map(json.loads, (output / "units.jsonl").read_text().splitlines())
             }
-            self.assertEqual(set(rows), {"broken.i", "fixtures.i"})
-            self.assertEqual(rows["broken.i"]["status"], "parse_failed")
-            self.assertEqual(rows["fixtures.i"]["status"], "extracted")
-            self.assertTrue(rows["fixtures.i"]["bitcode"])
+            self.assertEqual(set(rows), {0, 1, 2})
+            self.assertEqual(rows[2]["status"], "parse_failed")
+            self.assertEqual(rows[0]["status"], "extracted")
+            self.assertEqual(rows[1]["status"], "extracted")
             functions = [json.loads(line) for line in (output / "functions.jsonl").read_text().splitlines()]
             self.assertTrue(any(row["function"] == "constant_error" for row in functions))
             records = [json.loads(line) for line in (output / "records.jsonl").read_text().splitlines()]
             self.assertTrue(any(record["syscall"] == "pidfd_getfd" for record in records))
+            configured = {
+                (record["unit_index"], record["args"][0])
+                for record in records
+                if record["args"] in ([23, 0, 1], [31, 0, 1])
+            }
+            self.assertEqual(configured, {(0, 23), (1, 31)})
             summary = json.loads((output / "summary.json").read_text())
-            self.assertEqual(summary["artifacts"], 2)
-            self.assertEqual(summary["processed_artifacts"], 2)
-            self.assertEqual(sum(summary["artifact_status_counts"].values()), 2)
+            self.assertEqual(summary["compilation_units"], 3)
+            self.assertEqual(summary["processed_units"], 3)
+            self.assertEqual(sum(summary["unit_status_counts"].values()), 3)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze Clang preprocessed artifacts without rebuilding the target project."""
+"""Analyze every compilation unit in a compile_commands.json database."""
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 class Runner:
-    """Run one analyzer process with bounded resources and classify failures."""
+    """Run one compilation-unit analysis with bounded resources."""
 
     def __init__(self, extractor, output, timeout, memory_mb, output_mb):
         self.extractor = Path(extractor).resolve()
@@ -42,12 +42,20 @@ class Runner:
                 except ProcessLookupError:
                     pass
 
-    def run(self, artifact, artifact_dir, analyzer_args=()):
-        artifact = Path(artifact).resolve()
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        output_path = artifact_dir / "output.json"
-        error_path = artifact_dir / "stderr.txt"
-        command = [str(self.extractor), "--all-functions", *analyzer_args, str(artifact)]
+    def run(self, compdb, unit_index, unit_dir, analyzer_args=()):
+        compdb = Path(compdb).resolve()
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        output_path = unit_dir / "output.json"
+        error_path = unit_dir / "stderr.txt"
+        command = [
+            str(self.extractor),
+            "--compdb",
+            str(compdb),
+            "--unit-index",
+            str(unit_index),
+            "--all-functions",
+            *analyzer_args,
+        ]
         wrapper = [
             sys.executable,
             "-B",
@@ -73,7 +81,7 @@ class Runner:
             with output_path.open("wb") as stdout, error_path.open("wb") as stderr:
                 process = subprocess.Popen(
                     wrapper,
-                    cwd=artifact.parent,
+                    cwd=compdb.parent,
                     stdout=stdout,
                     stderr=stderr,
                     start_new_session=True,
@@ -91,22 +99,17 @@ class Runner:
                     with self.lock:
                         self.active.discard(process)
 
-            metadata.update(
-                returncode=code,
-                elapsed_seconds=round(time.monotonic() - started, 3),
-            )
+            metadata.update(returncode=code, elapsed_seconds=round(time.monotonic() - started, 3))
             memory_error = compiler_error = False
             with error_path.open("rb") as stream:
                 carry = b""
                 for chunk in iter(lambda: stream.read(65536), b""):
                     diagnostic = carry + chunk
-                    memory_error |= bool(
-                        re.search(
-                            rb"out of memory|bad_alloc|cannot allocate memory|failed to map segment|memoryerror",
-                            diagnostic,
-                            re.I,
-                        )
-                    )
+                    memory_error |= bool(re.search(
+                        rb"out of memory|bad_alloc|cannot allocate memory|failed to map segment|memoryerror",
+                        diagnostic,
+                        re.I,
+                    ))
                     compiler_error |= bool(re.search(rb"(?:fatal )?error:", diagnostic))
                     carry = diagnostic[-128:]
                 stream.seek(max(0, error_path.stat().st_size - 6000))
@@ -131,7 +134,7 @@ class Runner:
 
             try:
                 data = json.loads(output_path.read_text())
-                if data.get("schema_version") != 1:
+                if data.get("schema_version") != 2:
                     raise ValueError("unsupported analyzer schema")
                 if not isinstance(data.get("functions"), list) or not isinstance(data.get("records"), list):
                     raise ValueError("missing analyzer arrays")
@@ -150,24 +153,31 @@ class Runner:
             return metadata, None
 
 
-def artifact_status(functions):
-    statuses = {function.get("status") for function in functions}
-    if "extracted" in statuses:
-        return "extracted"
-    if "unsupported" in statuses:
-        return "unsupported"
-    return "no_records"
+def unit_status(functions):
+    return "extracted" if any(function.get("status") == "extracted" for function in functions) else "no_records"
 
 
-def analyze_artifact(path, root, runner, analyzer_args):
-    relative = path.relative_to(root).as_posix()
-    artifact_id = hashlib.sha256(relative.encode()).hexdigest()[:16]
-    metadata, data = runner.run(path, runner.output / "artifacts" / artifact_id, analyzer_args)
+def absolute_source(entry):
+    source = Path(entry["file"])
+    if not source.is_absolute():
+        source = Path(entry["directory"]) / source
+    return source.resolve()
+
+
+def analyze_unit(index, entry, compdb, runner, analyzer_args):
+    source = absolute_source(entry)
+    identity = json.dumps(
+        [index, entry.get("directory"), entry.get("file"), entry.get("arguments", entry.get("command"))],
+        sort_keys=True,
+    )
+    unit_id = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    metadata, data = runner.run(compdb, index, runner.output / "units" / unit_id, analyzer_args)
     row = {
-        "path": relative,
-        "language": "c++" if path.suffix == ".ii" else "c",
-        "size_bytes": path.stat().st_size,
-        "bitcode": path.with_suffix(".bc").is_file(),
+        "index": index,
+        "file": entry["file"],
+        "source": str(source),
+        "directory": entry["directory"],
+        "language": "c++" if source.suffix.lower() in {".cc", ".cpp", ".cxx", ".c++"} else "c",
         "execution": metadata,
         "record_count": 0,
     }
@@ -175,29 +185,20 @@ def analyze_artifact(path, root, runner, analyzer_args):
         row.update(status=metadata["status"], reason=metadata["reason"])
         return row, [], []
 
-    functions = []
-    for function in data["functions"]:
-        functions.append(
-            {
-                **function,
-                "artifact": relative,
-                "translation_unit_source": data.get("source"),
-                "target": data.get("target"),
-            }
-        )
-    records = data["records"]
+    functions = [
+        {**function, "unit_index": index, "translation_unit_source": data.get("source")}
+        for function in data["functions"]
+    ]
+    records = [
+        {**record, "unit_index": index, "translation_unit_source": data.get("source")}
+        for record in data["records"]
+    ]
     row.update(
-        status=artifact_status(functions),
-        source=data.get("source"),
-        target=data.get("target"),
-        target_source=data.get("target_source"),
-        warnings=data.get("warnings", []),
+        status=unit_status(functions),
         function_count=len(functions),
         function_status_counts=dict(Counter(function["status"] for function in functions)),
         record_count=len(records),
     )
-    if not functions:
-        row["reason"] = "no_original_source_functions"
     return row, functions, records
 
 
@@ -205,58 +206,69 @@ def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+def load_entries(path, parser):
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        parser.error(f"unable to read compilation database: {error}")
+    if not isinstance(entries, list):
+        parser.error("compilation database root must be an array")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("directory"), str) or not isinstance(entry.get("file"), str):
+            parser.error(f"invalid compilation database entry {index}")
+        if not isinstance(entry.get("arguments"), list) and not isinstance(entry.get("command"), str):
+            parser.error(f"entry {index} has neither arguments nor command")
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("artifact_root", type=Path, help="Directory containing .i/.ii files")
+    parser.add_argument("compdb", type=Path, help="Path to compile_commands.json")
     parser.add_argument("--extractor", type=Path, default=ROOT / "build/syscall-extract")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--include", action="append", default=[], help="Artifact-root-relative glob; repeatable")
-    parser.add_argument("--target", help="Override the target triple for every artifact")
+    parser.add_argument("--include", action="append", default=[], help="Glob matched against source paths; repeatable")
     parser.add_argument("--syscall", action="append", default=[], help="Only emit this syscall; repeatable")
     parser.add_argument("--jobs", type=int, default=4)
-    parser.add_argument("--timeout", type=float, default=20, help="Seconds per translation unit")
+    parser.add_argument("--timeout", type=float, default=20, help="Seconds per compilation unit")
     parser.add_argument("--memory-mb", type=int, default=1024, help="Per-process address space limit")
     parser.add_argument("--output-mb", type=int, default=16, help="Per-process stdout/stderr file limit")
     args = parser.parse_args()
     if args.jobs < 1 or args.timeout <= 0 or args.memory_mb < 64 or args.output_mb < 1:
         parser.error("invalid process/resource limits")
 
-    root = args.artifact_root.resolve()
-    if not root.is_dir():
-        parser.error(f"artifact directory not found: {root}")
+    compdb = args.compdb.resolve()
+    if not compdb.is_file():
+        parser.error(f"compilation database not found: {compdb}")
     if not args.extractor.is_file():
         parser.error("build syscall-extract before scanning")
+    entries = load_entries(compdb, parser)
+    selected = [
+        (index, entry)
+        for index, entry in enumerate(entries)
+        if not args.include
+        or any(
+            fnmatch.fnmatchcase(entry["file"], pattern)
+            or fnmatch.fnmatchcase(str(absolute_source(entry)), pattern)
+            for pattern in args.include
+        )
+    ]
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output = (args.output or ROOT / "out" / ("scan-" + stamp)).resolve()
-    if output == root or output.is_relative_to(root):
-        parser.error("use an output directory outside the artifact tree")
     if output.exists():
         parser.error(f"output already exists: {output}")
-
-    artifacts = sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix in {".i", ".ii"}
-        and (
-            not args.include
-            or any(fnmatch.fnmatchcase(path.relative_to(root).as_posix(), pattern) for pattern in args.include)
-        )
-    )
     output.mkdir(parents=True)
-    analyzer_args = []
-    if args.target:
-        analyzer_args.append("--target=" + args.target)
-    analyzer_args.extend("--syscall=" + syscall for syscall in args.syscall)
+    analyzer_args = ["--syscall=" + syscall for syscall in args.syscall]
 
     started = time.monotonic()
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "state": "running",
-        "artifact_root": str(root),
+        "compilation_database": str(compdb),
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "artifacts": len(artifacts),
-        "processed_artifacts": 0,
+        "database_entries": len(entries),
+        "compilation_units": len(selected),
+        "processed_units": 0,
         "functions": 0,
         "records": 0,
         "limits": {
@@ -266,37 +278,34 @@ def main():
             "output_mb": args.output_mb,
         },
         "include": args.include,
-        "target_override": args.target,
         "syscall_filter": args.syscall,
-        "scope": "Only .i/.ii artifacts present in the artifact tree are counted.",
     }
     write_json(output / "summary.json", summary)
 
     runner = Runner(args.extractor, output, args.timeout, args.memory_mb, args.output_mb)
-    artifact_counts = Counter()
+    unit_counts = Counter()
     function_counts = Counter()
-    seen_records = set()
     last_progress = time.monotonic()
-    print(f"Artifacts: {len(artifacts)}; output: {output}", flush=True)
+    print(f"Compilation units: {len(selected)}; output: {output}", flush=True)
     pool = ThreadPoolExecutor(max_workers=args.jobs)
     futures = {
-        pool.submit(analyze_artifact, path, root, runner, analyzer_args): path
-        for path in artifacts
+        pool.submit(analyze_unit, index, entry, compdb, runner, analyzer_args): (index, entry)
+        for index, entry in selected
     }
     try:
         with (
-            (output / "artifacts.jsonl").open("w") as artifact_stream,
+            (output / "units.jsonl").open("w") as unit_stream,
             (output / "functions.jsonl").open("w") as function_stream,
             (output / "records.jsonl").open("w") as record_stream,
         ):
             for future in as_completed(futures):
-                path = futures[future]
+                index, entry = futures[future]
                 try:
                     row, functions, records = future.result()
                 except Exception as error:
                     row = {
-                        "path": path.relative_to(root).as_posix(),
-                        "language": "c++" if path.suffix == ".ii" else "c",
+                        "index": index,
+                        "file": entry.get("file"),
                         "status": "analysis_failed",
                         "reason": "scanner_exception",
                         "detail": repr(error),
@@ -304,28 +313,24 @@ def main():
                     }
                     functions, records = [], []
 
-                artifact_stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-                artifact_stream.flush()
-                artifact_counts[row["status"]] += 1
+                unit_stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                unit_stream.flush()
+                unit_counts[row["status"]] += 1
                 for function in functions:
                     function_counts[function["status"]] += 1
                     function_stream.write(json.dumps(function, ensure_ascii=False) + "\n")
                 function_stream.flush()
                 for record in records:
-                    key = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                    if key in seen_records:
-                        continue
-                    seen_records.add(key)
                     record_stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                 record_stream.flush()
 
-                summary["processed_artifacts"] += 1
+                summary["processed_units"] += 1
                 summary["functions"] += len(functions)
-                summary["records"] = len(seen_records)
-                if time.monotonic() - last_progress > 10 or summary["processed_artifacts"] == len(artifacts):
+                summary["records"] += len(records)
+                if time.monotonic() - last_progress > 10 or summary["processed_units"] == len(selected):
                     print(
-                        f"Processed {summary['processed_artifacts']}/{len(artifacts)} artifacts; "
-                        f"{summary['records']} records; statuses={dict(artifact_counts)}",
+                        f"Processed {summary['processed_units']}/{len(selected)} units; "
+                        f"{summary['records']} records; statuses={dict(unit_counts)}",
                         flush=True,
                     )
                     last_progress = time.monotonic()
@@ -338,7 +343,7 @@ def main():
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
         summary.update(
-            artifact_status_counts=dict(artifact_counts),
+            unit_status_counts=dict(unit_counts),
             function_status_counts=dict(function_counts),
             elapsed_seconds=round(time.monotonic() - started, 2),
             finished_at=datetime.now(timezone.utc).isoformat(),

@@ -131,3 +131,9 @@ TEST(reassignment) {
   pidfd = 9;
   EXPECT_EQ(getfd(pidfd, 0, 1), -1);
 }
+
+#ifdef COMPDB_PIDFD
+TEST(command_line_define) {
+  EXPECT_EQ(getfd(COMPDB_PIDFD, 0, 1), -1);
+}
+#endif
