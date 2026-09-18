@@ -11,7 +11,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "tests/src/fixtures.c"
+SOURCES = sorted((ROOT / "tests/src").glob("*.c"))
 EXPECTED = ROOT / "tests/records.json"
 EXTRACTOR = Path(os.environ.get("SYSCALL_EXTRACTOR", ROOT / "build/syscall-extract"))
 CLANG = os.environ.get("CLANG", shutil.which("clang-21") or shutil.which("clang"))
@@ -45,26 +45,38 @@ class StandardRecordsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             build_dir = Path(temporary)
             compdb = build_dir / "compile_commands.json"
-            compdb.write_text(json.dumps([{
-                "directory": str(build_dir),
-                "file": str(SOURCE),
-                "arguments": [
-                    CLANG,
-                    "-DCOMPDB_PIDFD=17",
-                    "-c",
-                    str(SOURCE),
-                    "-o",
-                    str(build_dir / "fixtures.o"),
-                ],
-            }]))
-            result = subprocess.run(
-                [str(EXTRACTOR), f"--compdb={compdb}", "--all-functions"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            compdb.write_text(json.dumps([
+                {
+                    "directory": str(build_dir),
+                    "file": str(source),
+                    "arguments": [
+                        CLANG,
+                        "-DCOMPDB_PIDFD=17",
+                        "-c",
+                        str(source),
+                        "-o",
+                        str(build_dir / (source.stem + ".o")),
+                    ],
+                }
+                for source in SOURCES
+            ]))
+            actual_by_key = {}
+            for unit_index in range(len(SOURCES)):
+                result = subprocess.run(
+                    [
+                        str(EXTRACTOR),
+                        f"--compdb={compdb}",
+                        f"--unit-index={unit_index}",
+                        "--all-functions",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                for record in json.loads(result.stdout)["records"]:
+                    actual_by_key.setdefault(canonical(record), record)
 
-        actual = json.loads(result.stdout)["records"]
+        actual = list(actual_by_key.values())
         for record in actual:
             self.assertEqual(set(record), RECORD_FIELDS)
 
