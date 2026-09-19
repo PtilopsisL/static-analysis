@@ -201,6 +201,45 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(record["args"], [616, 0, 0])
         self.assertEqual(record["result"], {"ret": {"op": ">=", "value": 1}})
 
+    def test_clang_path_selects_only_the_feasible_disjunct(self):
+        record, = self.extract("clang_selects_feasible_disjunct")["records"]
+        self.assertEqual(record["args"], [617, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 2}})
+
+    def test_clang_unions_assertion_success_paths(self):
+        record, = self.extract("clang_unions_success_paths")["records"]
+        self.assertEqual(record["args"], [618, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "<=", "value": 0}})
+
+    def test_success_paths_preserve_result_errno_correlation(self):
+        records = self.extract(
+            "success_paths_preserve_result_errno_correlation"
+        )["records"]
+        self.assertEqual(
+            [record["result"] for record in records],
+            [
+                {
+                    "ret": {"op": "==", "value": -1},
+                    "errno": {"op": "==", "value": 22},
+                },
+                {
+                    "ret": {"op": "==", "value": -2},
+                    "errno": {"op": "==", "value": 5},
+                },
+            ],
+        )
+
+    def test_errno_range_uses_integer_type_limits(self):
+        record, = self.extract("errno_range_uses_integer_type_limits")["records"]
+        self.assertEqual(record["args"], [620, 0, 0])
+        self.assertEqual(
+            record["result"],
+            {
+                "ret": {"op": "==", "value": -1},
+                "errno": {"op": "!=", "value": 0},
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -112,124 +112,140 @@ struct ResultConstraint {
   int64_t value = 0;
 };
 
-struct IntegerDomain {
-  std::optional<int64_t> lower;
-  std::optional<int64_t> upper;
-  std::set<int64_t> excluded;
-  bool empty = false;
+struct IntegerRange {
+  int64_t lower;
+  int64_t upper;
+
+  bool operator==(const IntegerRange &Other) const {
+    return lower == Other.lower && upper == Other.upper;
+  }
 };
 
-static void normalizeDomain(IntegerDomain &Domain) {
-  if (Domain.empty)
-    return;
-  auto Outside = [&](int64_t Value) {
-    return (Domain.lower && Value < *Domain.lower) ||
-           (Domain.upper && Value > *Domain.upper);
-  };
-  for (auto It = Domain.excluded.begin(); It != Domain.excluded.end();)
-    if (Outside(*It))
-      It = Domain.excluded.erase(It);
-    else
-      ++It;
+struct IntegerDomain {
+  std::vector<IntegerRange> ranges;
 
-  while (Domain.lower && Domain.excluded.erase(*Domain.lower)) {
-    if (*Domain.lower == std::numeric_limits<int64_t>::max()) {
-      Domain.empty = true;
-      return;
+  bool empty() const { return ranges.empty(); }
+};
+
+static IntegerDomain fullDomain() {
+  return {{{std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::max()}}};
+}
+
+static void normalizeDomain(IntegerDomain &Domain) {
+  Domain.ranges.erase(
+      std::remove_if(Domain.ranges.begin(), Domain.ranges.end(),
+                     [](const IntegerRange &R) { return R.lower > R.upper; }),
+      Domain.ranges.end());
+  std::sort(Domain.ranges.begin(), Domain.ranges.end(),
+            [](const IntegerRange &LHS, const IntegerRange &RHS) {
+              return LHS.lower < RHS.lower ||
+                     (LHS.lower == RHS.lower && LHS.upper < RHS.upper);
+            });
+  std::vector<IntegerRange> Merged;
+  for (const IntegerRange &R : Domain.ranges) {
+    if (Merged.empty() ||
+        (Merged.back().upper != std::numeric_limits<int64_t>::max() &&
+         R.lower > Merged.back().upper + 1)) {
+      Merged.push_back(R);
+      continue;
     }
-    ++*Domain.lower;
+    Merged.back().upper = std::max(Merged.back().upper, R.upper);
   }
-  while (Domain.upper && Domain.excluded.erase(*Domain.upper)) {
-    if (*Domain.upper == std::numeric_limits<int64_t>::min()) {
-      Domain.empty = true;
-      return;
-    }
-    --*Domain.upper;
-  }
-  if (Domain.lower && Domain.upper && *Domain.lower > *Domain.upper)
-    Domain.empty = true;
+  Domain.ranges = std::move(Merged);
 }
 
 static IntegerDomain constraintDomain(const ResultConstraint &Constraint) {
+  constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+  constexpr int64_t Max = std::numeric_limits<int64_t>::max();
   IntegerDomain Domain;
   if (Constraint.op == "==") {
-    Domain.lower = Constraint.value;
-    Domain.upper = Constraint.value;
+    Domain.ranges.push_back({Constraint.value, Constraint.value});
   } else if (Constraint.op == "!=") {
-    Domain.excluded.insert(Constraint.value);
-  } else if (Constraint.op == ">") {
-    if (Constraint.value == std::numeric_limits<int64_t>::max())
-      Domain.empty = true;
-    else
-      Domain.lower = Constraint.value + 1;
+    if (Constraint.value != Min)
+      Domain.ranges.push_back({Min, Constraint.value - 1});
+    if (Constraint.value != Max)
+      Domain.ranges.push_back({Constraint.value + 1, Max});
+  } else if (Constraint.op == ">" && Constraint.value != Max) {
+    Domain.ranges.push_back({Constraint.value + 1, Max});
   } else if (Constraint.op == ">=") {
-    Domain.lower = Constraint.value;
-  } else if (Constraint.op == "<") {
-    if (Constraint.value == std::numeric_limits<int64_t>::min())
-      Domain.empty = true;
-    else
-      Domain.upper = Constraint.value - 1;
+    Domain.ranges.push_back({Constraint.value, Max});
+  } else if (Constraint.op == "<" && Constraint.value != Min) {
+    Domain.ranges.push_back({Min, Constraint.value - 1});
   } else if (Constraint.op == "<=") {
-    Domain.upper = Constraint.value;
-  } else {
-    Domain.empty = true;
+    Domain.ranges.push_back({Min, Constraint.value});
   }
-  normalizeDomain(Domain);
   return Domain;
 }
 
 static IntegerDomain intersectDomains(IntegerDomain LHS, IntegerDomain RHS) {
+  normalizeDomain(LHS);
+  normalizeDomain(RHS);
   IntegerDomain Result;
-  Result.empty = LHS.empty || RHS.empty;
-  if (LHS.lower && RHS.lower)
-    Result.lower = std::max(*LHS.lower, *RHS.lower);
-  else
-    Result.lower = LHS.lower ? LHS.lower : RHS.lower;
-  if (LHS.upper && RHS.upper)
-    Result.upper = std::min(*LHS.upper, *RHS.upper);
-  else
-    Result.upper = LHS.upper ? LHS.upper : RHS.upper;
-  Result.excluded = std::move(LHS.excluded);
-  Result.excluded.insert(RHS.excluded.begin(), RHS.excluded.end());
-  normalizeDomain(Result);
+  size_t Left = 0;
+  size_t Right = 0;
+  while (Left < LHS.ranges.size() && Right < RHS.ranges.size()) {
+    const IntegerRange &A = LHS.ranges[Left];
+    const IntegerRange &B = RHS.ranges[Right];
+    int64_t Lower = std::max(A.lower, B.lower);
+    int64_t Upper = std::min(A.upper, B.upper);
+    if (Lower <= Upper)
+      Result.ranges.push_back({Lower, Upper});
+    if (A.upper < B.upper)
+      ++Left;
+    else
+      ++Right;
+  }
   return Result;
+}
+
+static IntegerDomain unionDomains(IntegerDomain LHS, IntegerDomain RHS) {
+  LHS.ranges.insert(LHS.ranges.end(), RHS.ranges.begin(), RHS.ranges.end());
+  normalizeDomain(LHS);
+  return LHS;
+}
+
+static bool equalDomains(IntegerDomain LHS, IntegerDomain RHS) {
+  normalizeDomain(LHS);
+  normalizeDomain(RHS);
+  return LHS.ranges == RHS.ranges;
+}
+
+static bool isFullDomain(IntegerDomain Domain) {
+  normalizeDomain(Domain);
+  return Domain.ranges.size() == 1 &&
+         Domain.ranges.front().lower == std::numeric_limits<int64_t>::min() &&
+         Domain.ranges.front().upper == std::numeric_limits<int64_t>::max();
 }
 
 static bool domainHasPositiveSolution(IntegerDomain Domain) {
   normalizeDomain(Domain);
-  if (Domain.empty || (Domain.upper && *Domain.upper < 1))
-    return false;
-  int64_t Candidate = std::max<int64_t>(Domain.lower.value_or(1), 1);
-  while (Domain.excluded.count(Candidate)) {
-    if (Candidate == std::numeric_limits<int64_t>::max())
-      return false;
-    ++Candidate;
-  }
-  return !Domain.upper || Candidate <= *Domain.upper;
+  return std::any_of(Domain.ranges.begin(), Domain.ranges.end(),
+                     [](const IntegerRange &R) { return R.upper >= 1; });
 }
 
 static std::optional<ResultConstraint>
 constraintForDomain(IntegerDomain Domain) {
+  constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+  constexpr int64_t Max = std::numeric_limits<int64_t>::max();
   normalizeDomain(Domain);
-  if (Domain.empty)
-    return std::nullopt;
-  if (Domain.lower && Domain.upper && *Domain.lower == *Domain.upper &&
-      Domain.excluded.empty())
-    return ResultConstraint{"==", *Domain.lower};
-  if (!Domain.excluded.empty()) {
-    if (!Domain.lower && !Domain.upper && Domain.excluded.size() == 1)
-      return ResultConstraint{"!=", *Domain.excluded.begin()};
+  if (Domain.ranges.size() == 1) {
+    const IntegerRange &R = Domain.ranges.front();
+    if (R.lower == R.upper)
+      return ResultConstraint{"==", R.lower};
+    if (R.lower == Min && R.upper != Max)
+      return ResultConstraint{"<=", R.upper};
+    if (R.upper == Max && R.lower != Min)
+      return ResultConstraint{">=", R.lower};
     return std::nullopt;
   }
-  if (Domain.lower && !Domain.upper)
-    return ResultConstraint{">=", *Domain.lower};
-  if (!Domain.lower && Domain.upper)
-    return ResultConstraint{"<=", *Domain.upper};
-  if (Domain.lower && Domain.upper) {
-    if (*Domain.lower == std::numeric_limits<int64_t>::min())
-      return ResultConstraint{"<=", *Domain.upper};
-    if (*Domain.upper == std::numeric_limits<int64_t>::max())
-      return ResultConstraint{">=", *Domain.lower};
+  if (Domain.ranges.size() == 2) {
+    const IntegerRange &Left = Domain.ranges[0];
+    const IntegerRange &Right = Domain.ranges[1];
+    if (Left.lower == Min && Right.upper == Max && Left.upper != Max &&
+        Right.lower != Min &&
+        static_cast<__int128>(Left.upper) + 2 == Right.lower)
+      return ResultConstraint{"!=", Left.upper + 1};
   }
   return std::nullopt;
 }
@@ -252,9 +268,9 @@ projectDomain(const std::optional<IntegerDomain> &Stored) {
     return {ProjectionKind::Unconstrained, std::nullopt};
   IntegerDomain Domain = *Stored;
   normalizeDomain(Domain);
-  if (Domain.empty)
+  if (Domain.empty())
     return {ProjectionKind::Unsatisfiable, std::nullopt};
-  if (!Domain.lower && !Domain.upper && Domain.excluded.empty())
+  if (isFullDomain(Domain))
     return {ProjectionKind::Unconstrained, std::nullopt};
   if (auto Constraint = constraintForDomain(Domain))
     return {ProjectionKind::Exact, std::move(Constraint)};
@@ -268,11 +284,11 @@ static std::optional<int64_t> signedDomainValue(const llvm::APSInt &Value) {
 }
 
 static std::optional<IntegerDomain> domainForRangeSet(const RangeSet &Ranges) {
+  constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+  constexpr int64_t Max = std::numeric_limits<int64_t>::max();
   IntegerDomain Domain;
-  if (Ranges.isEmpty()) {
-    Domain.empty = true;
+  if (Ranges.isEmpty())
     return Domain;
-  }
   APSIntType Type = Ranges.getAPSIntType();
   if (Type.getBitWidth() > 64 || Type.isUnsigned())
     return std::nullopt;
@@ -280,31 +296,14 @@ static std::optional<IntegerDomain> domainForRangeSet(const RangeSet &Ranges) {
   auto TypeMax = signedDomainValue(Type.getMaxValue());
   if (!TypeMin || !TypeMax)
     return std::nullopt;
-
-  bool First = true;
-  int64_t PreviousUpper = 0;
   for (const Range &R : Ranges) {
     auto Lower = signedDomainValue(R.From());
     auto Upper = signedDomainValue(R.To());
     if (!Lower || !Upper)
       return std::nullopt;
-    if (First) {
-      if (*Lower != *TypeMin)
-        Domain.lower = *Lower;
-      First = false;
-    } else {
-      __int128 GapSize = static_cast<__int128>(*Lower) - PreviousUpper - 1;
-      // IntegerDomain represents holes as excluded points. Large gaps remain
-      // on the conservative fallback until RangeSet becomes the native state.
-      if (GapSize < 0 || GapSize > 64)
-        return std::nullopt;
-      for (int64_t Value = PreviousUpper + 1; Value < *Lower; ++Value)
-        Domain.excluded.insert(Value);
-    }
-    PreviousUpper = *Upper;
+    Domain.ranges.push_back(
+        {*Lower == *TypeMin ? Min : *Lower, *Upper == *TypeMax ? Max : *Upper});
   }
-  if (PreviousUpper != *TypeMax)
-    Domain.upper = PreviousUpper;
   normalizeDomain(Domain);
   return Domain;
 }
@@ -323,7 +322,14 @@ struct Invocation {
   std::string function;
   std::string syscall;
   std::vector<ConcreteValue> args;
+  const Expr *eventSite = nullptr;
   bool concrete = false;
+};
+
+struct AssertionObservation {
+  const Expr *assertionSite;
+  const Invocation *call;
+  ConstraintDomains domains;
 };
 
 struct Subject {
@@ -356,14 +362,25 @@ class Collector {
     json::Object object;
   };
 
+  struct ObservationGroup {
+    const Expr *assertionSite;
+    const Expr *eventSite;
+    const Invocation *call;
+    std::string baseKey;
+    std::vector<ConstraintDomains> alternatives;
+  };
+
   std::set<std::string> SelectedFunctions;
   std::set<std::string> SelectedSyscalls;
   std::vector<std::unique_ptr<Invocation>> Invocations;
   std::vector<std::unique_ptr<ConstraintDomains>> ConstraintDomainStorage;
+  std::vector<std::unique_ptr<AssertionObservation>> AssertionObservations;
   std::vector<std::unique_ptr<PendingConstraint>> PendingConstraints;
   std::vector<std::unique_ptr<PredicateBinding>> PredicateBindings;
   std::set<std::string> SeenFunctions;
+  std::vector<ObservationGroup> ObservationGroups;
   std::vector<EmittedRecord> Records;
+  bool Finalized = false;
 
   static json::Object constraintJSON(const ResultConstraint &C) {
     return json::Object{{"op", C.op}, {"value", C.value}};
@@ -387,6 +404,131 @@ class Collector {
     OS << Value;
     OS.flush();
     return Text;
+  }
+
+  static std::string baseKey(const Invocation &Call) {
+    json::Array Args;
+    for (const ConcreteValue &Arg : Call.args)
+      Args.push_back(toJSON(Arg));
+    return render(
+        json::Object{{"syscall", Call.syscall}, {"args", std::move(Args)}});
+  }
+
+  static IntegerDomain
+  effectiveDomain(const std::optional<IntegerDomain> &Domain) {
+    return Domain.value_or(fullDomain());
+  }
+
+  static bool equalDomainFields(const std::optional<IntegerDomain> &LHS,
+                                const std::optional<IntegerDomain> &RHS) {
+    return equalDomains(effectiveDomain(LHS), effectiveDomain(RHS));
+  }
+
+  static bool mergeDomainFields(const std::optional<IntegerDomain> &LHS,
+                                const std::optional<IntegerDomain> &RHS,
+                                std::optional<IntegerDomain> &Merged) {
+    IntegerDomain Union =
+        unionDomains(effectiveDomain(LHS), effectiveDomain(RHS));
+    DomainProjection Projection = projectDomain(Union);
+    if (Projection.kind == ProjectionKind::Unconstrained) {
+      Merged.reset();
+      return true;
+    }
+    if (Projection.kind != ProjectionKind::Exact)
+      return false;
+    Merged = std::move(Union);
+    return true;
+  }
+
+  static void canonicalize(ConstraintDomains &Domains) {
+    if (Domains.ret) {
+      normalizeDomain(*Domains.ret);
+      if (isFullDomain(*Domains.ret))
+        Domains.ret.reset();
+    }
+    if (Domains.error) {
+      normalizeDomain(*Domains.error);
+      if (isFullDomain(*Domains.error))
+        Domains.error.reset();
+    }
+  }
+
+  static void mergeAlternatives(std::vector<ConstraintDomains> &Alternatives) {
+    for (ConstraintDomains &Domains : Alternatives)
+      canonicalize(Domains);
+    bool Changed;
+    do {
+      Changed = false;
+      for (size_t I = 0; I < Alternatives.size() && !Changed; ++I) {
+        for (size_t J = I + 1; J < Alternatives.size(); ++J) {
+          ConstraintDomains Merged;
+          if (equalDomainFields(Alternatives[I].error, Alternatives[J].error) &&
+              mergeDomainFields(Alternatives[I].ret, Alternatives[J].ret,
+                                Merged.ret)) {
+            Merged.error = Alternatives[I].error;
+          } else if (equalDomainFields(Alternatives[I].ret,
+                                       Alternatives[J].ret) &&
+                     mergeDomainFields(Alternatives[I].error,
+                                       Alternatives[J].error, Merged.error)) {
+            Merged.ret = Alternatives[I].ret;
+          } else {
+            continue;
+          }
+          canonicalize(Merged);
+          Alternatives[I] = std::move(Merged);
+          Alternatives.erase(Alternatives.begin() + J);
+          Changed = true;
+          break;
+        }
+      }
+    } while (Changed);
+  }
+
+  void appendRecord(const Invocation *Call, const std::string &BaseKey,
+                    const ConstraintDomains &Domains) {
+    DomainProjection Ret = projectDomain(Domains.ret);
+    DomainProjection Error = projectDomain(Domains.error);
+    auto CannotEmit = [](ProjectionKind Kind) {
+      return Kind == ProjectionKind::Unsatisfiable ||
+             Kind == ProjectionKind::Unrepresentable;
+    };
+    if (CannotEmit(Ret.kind) || CannotEmit(Error.kind))
+      return;
+    ConstraintSet Result{std::move(Ret.constraint),
+                         std::move(Error.constraint)};
+    if (!Result.ret && !Result.error)
+      return;
+    if (Result.error && !Result.ret)
+      Result.ret = ResultConstraint{"==", -1};
+
+    for (auto It = Records.begin(); It != Records.end();) {
+      if (It->function != Call->function || It->baseKey != BaseKey) {
+        ++It;
+        continue;
+      }
+      if (subset(Result, It->result))
+        return;
+      if (subset(It->result, Result)) {
+        It = Records.erase(It);
+        continue;
+      }
+      ++It;
+    }
+
+    json::Array Args;
+    for (const ConcreteValue &Arg : Call->args)
+      Args.push_back(toJSON(Arg));
+    json::Object ResultObject;
+    if (Result.ret)
+      ResultObject["ret"] = constraintJSON(*Result.ret);
+    if (Result.error)
+      ResultObject["errno"] = constraintJSON(*Result.error);
+    json::Object Record{{"syscall", Call->syscall},
+                        {"args", std::move(Args)},
+                        {"result", std::move(ResultObject)}};
+    std::string FullKey = render(json::Object(Record));
+    Records.push_back({Call->function, BaseKey, std::move(FullKey),
+                       std::move(Result), std::move(Record)});
   }
 
 public:
@@ -420,6 +562,13 @@ public:
     return ConstraintDomainStorage.back().get();
   }
 
+  const AssertionObservation *
+  makeAssertionObservation(AssertionObservation Value) {
+    AssertionObservations.push_back(
+        std::make_unique<AssertionObservation>(std::move(Value)));
+    return AssertionObservations.back().get();
+  }
+
   const PendingConstraint *makePendingConstraint(PendingConstraint Value) {
     PendingConstraints.push_back(
         std::make_unique<PendingConstraint>(std::move(Value)));
@@ -432,60 +581,44 @@ public:
     return PredicateBindings.back().get();
   }
 
-  void emit(const Invocation *Call, const ConstraintDomains *Domains) {
-    if (!Call || !Domains || !Call->concrete ||
-        !wantsFunction(Call->function) || !wantsSyscall(Call->syscall))
+  void observe(const Expr *AssertionSite, const Invocation *Call,
+               ConstraintDomains Domains) {
+    if (!Call || !Call->concrete || !wantsFunction(Call->function) ||
+        !wantsSyscall(Call->syscall))
       return;
-
-    DomainProjection Ret = projectDomain(Domains->ret);
-    DomainProjection Error = projectDomain(Domains->error);
-    auto CannotEmit = [](ProjectionKind Kind) {
-      return Kind == ProjectionKind::Unsatisfiable ||
-             Kind == ProjectionKind::Unrepresentable;
-    };
-    if (CannotEmit(Ret.kind) || CannotEmit(Error.kind))
+    Finalized = false;
+    canonicalize(Domains);
+    std::string Key = baseKey(*Call);
+    auto Group =
+        std::find_if(ObservationGroups.begin(), ObservationGroups.end(),
+                     [&](const ObservationGroup &Candidate) {
+                       return Candidate.assertionSite == AssertionSite &&
+                              Candidate.eventSite == Call->eventSite &&
+                              Candidate.call->function == Call->function &&
+                              Candidate.baseKey == Key;
+                     });
+    if (Group == ObservationGroups.end()) {
+      ObservationGroups.push_back({AssertionSite,
+                                   Call->eventSite,
+                                   Call,
+                                   std::move(Key),
+                                   {std::move(Domains)}});
       return;
-    ConstraintSet Result{std::move(Ret.constraint),
-                         std::move(Error.constraint)};
-    if (!Result.ret && !Result.error)
-      return;
-
-    json::Array BaseArgs;
-    for (const ConcreteValue &Arg : Call->args)
-      BaseArgs.push_back(toJSON(Arg));
-    std::string BaseKey = render(json::Object{{"syscall", Call->syscall},
-                                              {"args", std::move(BaseArgs)}});
-    for (auto It = Records.begin(); It != Records.end();) {
-      if (It->function != Call->function || It->baseKey != BaseKey) {
-        ++It;
-        continue;
-      }
-      if (subset(Result, It->result))
-        return;
-      if (subset(It->result, Result)) {
-        It = Records.erase(It);
-        continue;
-      }
-      ++It;
     }
+    Group->alternatives.push_back(std::move(Domains));
+  }
 
-    json::Array Args;
-    for (const ConcreteValue &Arg : Call->args)
-      Args.push_back(toJSON(Arg));
-    json::Object ResultObject;
-    if (Result.ret)
-      ResultObject["ret"] = constraintJSON(*Result.ret);
-    if (Result.error) {
-      ResultObject["errno"] = constraintJSON(*Result.error);
-      if (!Result.ret)
-        ResultObject["ret"] = constraintJSON({"==", -1});
+  void finalize() {
+    if (Finalized)
+      return;
+    Records.clear();
+    for (ObservationGroup &Group : ObservationGroups) {
+      std::vector<ConstraintDomains> Alternatives = Group.alternatives;
+      mergeAlternatives(Alternatives);
+      for (const ConstraintDomains &Domains : Alternatives)
+        appendRecord(Group.call, Group.baseKey, Domains);
     }
-    json::Object Record{{"syscall", Call->syscall},
-                        {"args", std::move(Args)},
-                        {"result", std::move(ResultObject)}};
-    std::string FullKey = render(json::Object(Record));
-    Records.push_back({Call->function, std::move(BaseKey), std::move(FullKey),
-                       std::move(Result), std::move(Record)});
+    Finalized = true;
   }
 
   json::Array functionJSON() const {
@@ -523,6 +656,8 @@ REGISTER_MAP_WITH_PROGRAMSTATE(SyscallBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ErrnoBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintsByCall, const Invocation *,
                                const ConstraintDomains *)
+REGISTER_SET_WITH_PROGRAMSTATE(PendingObservations,
+                               const AssertionObservation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintByComparison, const BinaryOperator *,
                                const PendingConstraint *)
 REGISTER_MAP_WITH_PROGRAMSTATE(PredicateByRegion, const MemRegion *,
@@ -1102,48 +1237,45 @@ class SyscallScenarioChecker
     return nullptr;
   }
 
-  static ProgramStateRef applyClause(ProgramStateRef State,
-                                     const ConstraintClause &Clause,
-                                     const ConstraintMap &ClangConstraints) {
-    for (const PendingConstraint &Pending : Clause) {
-      ConstraintDomains Updated;
-      if (const ConstraintDomains *const *Old =
-              State->get<ConstraintsByCall>(Pending.subject.call))
-        Updated = **Old;
-      std::optional<IntegerDomain> &Slot =
-          Pending.subject.error ? Updated.error : Updated.ret;
-      std::optional<IntegerDomain> ClangDomain;
-      if (Pending.subject.symbol)
-        if (const RangeSet *Ranges =
-                ClangConstraints.lookup(Pending.subject.symbol))
-          ClangDomain = domainForRangeSet(*Ranges);
-      IntegerDomain Incoming =
-          ClangDomain.value_or(constraintDomain(Pending.result));
-      Slot = Slot ? intersectDomains(std::move(*Slot), std::move(Incoming))
-                  : std::move(Incoming);
-      if (Slot->empty ||
-          (Pending.subject.error && !domainHasPositiveSolution(*Slot)))
-        return nullptr;
-      const ConstraintDomains *Stored =
-          ActiveCollector->makeConstraintDomains(std::move(Updated));
-      State = State->set<ConstraintsByCall>(Pending.subject.call, Stored);
+  static void collectEvaluatedConstraints(
+      const Expr *Expression, ProgramStateRef State,
+      std::map<SymbolRef, const PendingConstraint *> &Subjects) {
+    Expression = ignoreExpr(Expression);
+    if (!Expression)
+      return;
+    if (const auto *Binary = dyn_cast<BinaryOperator>(Expression)) {
+      if (Binary->isComparisonOp()) {
+        if (const PendingConstraint *const *Pending =
+                State->get<ConstraintByComparison>(Binary))
+          if ((*Pending)->subject.symbol &&
+              (!(*Pending)->subject.error ||
+               domainHasPositiveSolution(constraintDomain((*Pending)->result))))
+            Subjects.try_emplace((*Pending)->subject.symbol, *Pending);
+        return;
+      }
+      if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
+        collectEvaluatedConstraints(Binary->getLHS(), State, Subjects);
+        collectEvaluatedConstraints(Binary->getRHS(), State, Subjects);
+      }
+      return;
     }
-    return State;
+    if (const auto *Unary = dyn_cast<UnaryOperator>(Expression))
+      if (Unary->getOpcode() == UO_LNot)
+        collectEvaluatedConstraints(Unary->getSubExpr(), State, Subjects);
   }
 
   static bool applyPredicate(const Expr *Expression, bool Expected,
                              CheckerContext &C) {
     auto Extracted = extractPredicate(Expression, Expected, C);
-    if (!Extracted)
+    std::map<SymbolRef, const PendingConstraint *> Subjects;
+    if (Extracted)
+      for (const ConstraintClause &Clause : *Extracted)
+        for (const PendingConstraint &Pending : Clause)
+          if (Pending.subject.symbol)
+            Subjects.try_emplace(Pending.subject.symbol, &Pending);
+    collectEvaluatedConstraints(Expression, C.getState(), Subjects);
+    if (Subjects.empty())
       return false;
-    if (Extracted->empty())
-      return false;
-    // If one successful alternative imposes no syscall constraint, emitting
-    // only the narrower alternatives would invent an oracle the test does not
-    // actually require (for example, `ret == 0 || true`).
-    for (const ConstraintClause &Clause : *Extracted)
-      if (Clause.empty())
-        return false;
 
     ProgramStateRef Base = C.getState();
     if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
@@ -1152,12 +1284,47 @@ class SyscallScenarioChecker
         return true;
     }
     ConstraintMap ClangConstraints = getConstraintMap(Base);
+    bool AllowFallback = Extracted && Extracted->size() == 1;
     bool Added = false;
-    for (const ConstraintClause &Clause : *Extracted) {
-      if (ProgramStateRef Next = applyClause(Base, Clause, ClangConstraints)) {
-        C.addTransition(Next);
-        Added = true;
+    std::set<const Invocation *> TouchedCalls;
+    for (const auto &[Symbol, PendingPointer] : Subjects) {
+      const PendingConstraint &Pending = *PendingPointer;
+      std::optional<IntegerDomain> Domain;
+      if (const RangeSet *Ranges = ClangConstraints.lookup(Symbol))
+        Domain = domainForRangeSet(*Ranges);
+      if (!Domain)
+        Domain =
+            AllowFallback ? constraintDomain(Pending.result) : fullDomain();
+
+      ConstraintDomains Updated;
+      if (const ConstraintDomains *const *Old =
+              Base->get<ConstraintsByCall>(Pending.subject.call))
+        Updated = **Old;
+      std::optional<IntegerDomain> &Slot =
+          Pending.subject.error ? Updated.error : Updated.ret;
+      Slot = Slot ? intersectDomains(std::move(*Slot), *Domain)
+                  : std::move(*Domain);
+      if (Slot->empty() ||
+          (Pending.subject.error && !domainHasPositiveSolution(*Slot)))
+        continue;
+      const ConstraintDomains *Stored =
+          ActiveCollector->makeConstraintDomains(std::move(Updated));
+      Base = Base->set<ConstraintsByCall>(Pending.subject.call, Stored);
+      TouchedCalls.insert(Pending.subject.call);
+      Added = true;
+    }
+    if (Added) {
+      for (const Invocation *Call : TouchedCalls) {
+        const ConstraintDomains *const *Domains =
+            Base->get<ConstraintsByCall>(Call);
+        if (!Domains)
+          continue;
+        const AssertionObservation *Observation =
+            ActiveCollector->makeAssertionObservation(
+                {Expression, Call, **Domains});
+        Base = Base->add<PendingObservations>(Observation);
       }
+      C.addTransition(Base);
     }
     return Added;
   }
@@ -1212,6 +1379,7 @@ public:
     Invocation Value;
     Value.function = Function.str();
     Value.syscall = syscallName(Call, Number, C);
+    Value.eventSite = Call.getOriginExpr();
     Value.concrete = true;
     for (unsigned I = 1; I < Call.getNumArgs(); ++I) {
       auto Arg =
@@ -1331,8 +1499,10 @@ public:
   void checkEndFunction(const ReturnStmt *, CheckerContext &C) const {
     if (!C.inTopFrame() || !ActiveCollector)
       return;
-    for (const auto &Entry : C.getState()->get<ConstraintsByCall>())
-      ActiveCollector->emit(Entry.first, Entry.second);
+    for (const AssertionObservation *Observation :
+         C.getState()->get<PendingObservations>())
+      ActiveCollector->observe(Observation->assertionSite, Observation->call,
+                               Observation->domains);
   }
 };
 
@@ -1419,6 +1589,7 @@ int main(int argc, const char **argv) {
   ActiveCollector = nullptr;
   if (Status)
     return Status;
+  Results.finalize();
 
   json::Array CommandLine;
   for (const std::string &Arg : Command.CommandLine)

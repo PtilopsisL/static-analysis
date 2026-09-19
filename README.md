@@ -118,7 +118,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 }
 ```
 
-结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。只有 syscall 参数和关联断言都能在同一路径上具体化时才输出；未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束都会被过滤。checker 保持 syscall/errno symbol 存活，并优先读取 Clang 在 assertion 成功路径上给出的 `RangeSet`；OracleRecognizer 目前只负责把范围关联回 syscall event，并在 Clang 没有可用范围时提供保守回退。路径状态保存规范化的整数约束域，只在输出边界将其投影成当前 schema 的单个比较式；例如 `ret >= 0 && ret >= 1` 可投影为 `ret >= 1`，而最终仍为 `0 <= ret && ret < 10` 的约束会保守过滤。中间暂时无法投影的约束域仍可被后续条件继续收窄，例如再与 `ret == 5` 相交后可以精确输出。
+结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。只有 syscall 参数和关联断言都能在同一路径上具体化时才输出；未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束都会被过滤。checker 保持 syscall/errno symbol 存活，并优先读取 Clang 在 assertion 成功路径上给出的 `RangeSet`；OracleRecognizer 主要负责从实际执行过的 comparison 找回 syscall event provenance，并在 Clang 没有可用范围时提供保守回退。每个 assertion 成功状态只产生一个 analyzer transition；到达函数终点后，同一 assertion 的成功路径按 event 聚合。聚合仅在另一字段的约束相同时对 ret 或 errno 做精确并集，因此 `A || true` 会自然并成无约束而不输出，ret/errno 的分支相关性也不会被错误交叉组合。路径状态保存规范化的整数约束域，只在输出边界将其投影成当前 schema 的单个比较式；例如 `ret >= 0 && ret >= 1` 可投影为 `ret >= 1`，而最终仍为 `0 <= ret && ret < 10` 的约束会保守过滤。中间暂时无法投影的约束域仍可被后续条件继续收窄，例如再与 `ret == 5` 相交后可以精确输出。
 
 当前 checker 处理：
 

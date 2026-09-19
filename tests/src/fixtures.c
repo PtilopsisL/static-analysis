@@ -262,3 +262,26 @@ TEST(clang_path_constraint_strengthens_assertion) {
   if (ret >= 1)
     ksft_test_result(ret >= 0, "non-negative result\n");
 }
+
+TEST(clang_selects_feasible_disjunct) {
+  long ret = getfd(617, 0, 0);
+  if (ret >= 2)
+    ksft_test_result(ret == 1 || ret == 2, "expected result alternative\n");
+}
+
+TEST(clang_unions_success_paths) {
+  long ret = getfd(618, 0, 0);
+  ksft_test_result(ret < 0 || ret == 0, "expected non-positive result\n");
+}
+
+TEST(success_paths_preserve_result_errno_correlation) {
+  long ret = getfd(619, 0, 0);
+  ksft_test_result((ret == -1 && errno == EINVAL) ||
+                       (ret == -2 && errno == EIO),
+                   "expected correlated failure\n");
+}
+
+TEST(errno_range_uses_integer_type_limits) {
+  getfd(620, 0, 0);
+  ksft_test_result(errno != 0, "expected non-zero errno\n");
+}
