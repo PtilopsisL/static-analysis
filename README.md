@@ -118,17 +118,18 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 }
 ```
 
-结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。只有 syscall 参数和关联断言都能在同一路径上具体化时才输出；未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束都会被过滤。
+结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。只有 syscall 参数和关联断言都能在同一路径上具体化时才输出；未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束都会被过滤。同一返回值上的多个原子约束只有在能安全合并为当前 schema 可表示的单个约束时才保留；例如 `ret >= 0 && ret >= 1` 可归一化为 `ret >= 1`，而 `0 <= ret && ret < 10` 会保守过滤，而不是静默丢掉其中一半。
 
 当前 checker 处理：
 
 - 直接或经可内联 wrapper 调用的 libc `syscall`；
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
-- 展开后使用 `__exp` / `__seen` 临时变量的常见 `EXPECT` / `ASSERT` 比较；
+- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并识别已知的失败分支；不依赖 `__exp` / `__seen` 之类临时变量名；
 - syscall 返回值以及紧随其后的 `errno` 约束；
 - 指向具体结构体和字符串的 syscall 参数快照。
 
 控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加语义模型，而不是复制一套 C/C++ 执行器。
+predicate 临时值的来源随 analyzer 的 bind event 保存在 `ProgramState` 中，重新赋值或内存失效会自然覆盖该来源。已知 failure API 被建模为 sink；分支是否确定失败由 Clang CFG 上的可达性决定，而不是递归解释 AST 语句。
 
 ## 目录
 

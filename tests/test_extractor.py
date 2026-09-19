@@ -130,6 +130,65 @@ class ExtractionTests(unittest.TestCase):
         record, = self.extract("command_line_define")["records"]
         self.assertEqual(record["args"], [17, 0, 1])
 
+    def test_compound_constraints_keep_the_stronger_bound(self):
+        record, = self.extract("compound_constraint_strengthening")["records"]
+        self.assertEqual(record["args"], [600, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": ">=", "value": 1}})
+
+    def test_unrepresentable_range_is_not_weakened(self):
+        self.assertEqual(self.extract("unrepresentable_range")["records"], [])
+
+    def test_unconstrained_success_alternative_emits_nothing(self):
+        self.assertEqual(self.extract("unconstrained_success_alternative")["records"], [])
+
+    def test_reassigned_predicate_does_not_reuse_initializer(self):
+        self.assertEqual(self.extract("reassigned_predicate_variable")["records"], [])
+
+    def test_plain_exp_seen_names_are_not_an_assertion(self):
+        self.assertEqual(self.extract("assertion_temporary_lookalike")["records"], [])
+
+    def test_nested_possible_failure_is_not_a_definite_failure_guard(self):
+        self.assertEqual(self.extract("nested_possible_failure")["records"], [])
+
+    def test_unmodeled_syscall_invalidates_errno_owner(self):
+        record, = self.extract("unmodeled_syscall_number")["records"]
+        self.assertEqual(record["args"], [606, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": -1}})
+
+    def test_signedness_changing_cast_is_not_reinterpreted(self):
+        self.assertEqual(self.extract("unsigned_cast_ordering")["records"], [])
+
+    def test_subcondition_of_failure_guard_is_not_treated_as_full_guard(self):
+        self.assertEqual(self.extract("compound_failure_condition")["records"], [])
+
+    def test_no_success_condition_when_both_branches_fail(self):
+        self.assertEqual(self.extract("both_branches_fail")["records"], [])
+
+    def test_later_assignment_does_not_erase_an_earlier_assertion(self):
+        record, = self.extract("predicate_reassigned_after_assertion")["records"]
+        self.assertEqual(record["args"], [610, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
+
+    def test_cfg_proves_failure_after_nested_control_flow(self):
+        record, = self.extract("definite_failure_via_cfg")["records"]
+        self.assertEqual(record["args"], [611, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
+
+    def test_opaque_write_invalidates_predicate_provenance(self):
+        self.assertEqual(
+            self.extract("predicate_invalidated_by_opaque_write")["records"], []
+        )
+
+    def test_unknown_noreturn_is_not_a_failure_oracle(self):
+        self.assertEqual(
+            self.extract("unknown_noreturn_is_not_failure")["records"], []
+        )
+
+    def test_predicate_assignment_tracks_the_new_value(self):
+        record, = self.extract("predicate_assignment_tracks_new_value")["records"]
+        self.assertEqual(record["args"], [614, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

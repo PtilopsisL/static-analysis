@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -13,10 +14,9 @@
 #include <vector>
 
 #include <clang/AST/ASTContext.h>
-#include <clang/AST/ASTTypeTraits.h>
 #include <clang/AST/Expr.h>
-#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/Stmt.h>
+#include <clang/Analysis/CFG.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
@@ -137,6 +137,12 @@ struct PendingConstraint {
 using ConstraintClause = std::vector<PendingConstraint>;
 using Predicate = std::vector<ConstraintClause>;
 
+struct PredicateBinding {
+  SVal value;
+  std::optional<Predicate> whenTrue;
+  std::optional<Predicate> whenFalse;
+};
+
 class Collector {
   struct EmittedRecord {
     std::string function;
@@ -151,6 +157,7 @@ class Collector {
   std::vector<std::unique_ptr<Invocation>> Invocations;
   std::vector<std::unique_ptr<ConstraintSet>> Constraints;
   std::vector<std::unique_ptr<PendingConstraint>> PendingConstraints;
+  std::vector<std::unique_ptr<PredicateBinding>> PredicateBindings;
   std::set<std::string> SeenFunctions;
   std::vector<EmittedRecord> Records;
 
@@ -212,6 +219,12 @@ public:
     PendingConstraints.push_back(
         std::make_unique<PendingConstraint>(std::move(Value)));
     return PendingConstraints.back().get();
+  }
+
+  const PredicateBinding *makePredicateBinding(PredicateBinding Value) {
+    PredicateBindings.push_back(
+        std::make_unique<PredicateBinding>(std::move(Value)));
+    return PredicateBindings.back().get();
   }
 
   void emit(const Invocation *Call, const ConstraintSet *Result) {
@@ -294,7 +307,9 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintsByCall, const Invocation *,
                                const ConstraintSet *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintByComparison, const BinaryOperator *,
                                const PendingConstraint *)
-REGISTER_TRAIT_WITH_PROGRAMSTATE(LastSyscall, const Invocation *)
+REGISTER_MAP_WITH_PROGRAMSTATE(PredicateByRegion, const MemRegion *,
+                               const PredicateBinding *)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentErrnoOwner, const Invocation *)
 
 static const FunctionDecl *topFunction(const LocationContext *LC) {
   while (LC && LC->getParent())
@@ -413,19 +428,41 @@ static std::string syscallName(const CallEvent &Call, int64_t Number,
   }
 }
 
-static int signOf(const SymExpr *Expression, SymbolRef Atom) {
+static bool valuePreservingIntegerConversion(QualType From, QualType To,
+                                             ASTContext &Context) {
+  if (From.isNull() || To.isNull() || !From->isIntegerType() ||
+      !To->isIntegerType() || From->isBooleanType() || To->isBooleanType())
+    return false;
+  bool SameSignedness =
+      (From->isSignedIntegerType() && To->isSignedIntegerType()) ||
+      (From->isUnsignedIntegerType() && To->isUnsignedIntegerType());
+  return SameSignedness && Context.getIntWidth(To) >= Context.getIntWidth(From);
+}
+
+static bool valuePreservingCast(const SymbolCast *Cast, ASTContext &Context) {
+  return valuePreservingIntegerConversion(Cast->getOperand()->getType(),
+                                          Cast->getType(), Context);
+}
+
+static int signOf(const SymExpr *Expression, SymbolRef Atom,
+                  ASTContext &Context) {
   if (Expression == Atom)
     return 1;
-  if (const auto *Cast = dyn_cast<SymbolCast>(Expression))
-    return signOf(Cast->getOperand(), Atom);
+  if (const auto *Cast = dyn_cast<SymbolCast>(Expression)) {
+    if (!valuePreservingCast(Cast, Context))
+      return 0;
+    return signOf(Cast->getOperand(), Atom, Context);
+  }
   if (const auto *Unary = dyn_cast<UnarySymExpr>(Expression)) {
-    int Sign = signOf(Unary->getOperand(), Atom);
+    int Sign = signOf(Unary->getOperand(), Atom, Context);
     return Unary->getOpcode() == UO_Minus ? -Sign : 0;
   }
   return 0;
 }
 
-static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State) {
+static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
+                                          QualType ObservedType,
+                                          ASTContext &Context) {
   const SymExpr *Expression = Value.getAsSymbol(true);
   if (!Expression)
     return std::nullopt;
@@ -439,7 +476,13 @@ static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State) {
     }
     if (!Call)
       continue;
-    int Sign = signOf(Expression, Atom);
+    // The analyzer may represent a same-width signedness cast with the
+    // original symbol. Check the AST operand type as well as SymbolCast nodes
+    // so such a conversion cannot inherit the syscall's integer semantics.
+    if (!valuePreservingIntegerConversion(Atom->getType(), ObservedType,
+                                          Context))
+      return std::nullopt;
+    int Sign = signOf(Expression, Atom, Context);
     if (!Sign || (Found && Found->call != *Call))
       return std::nullopt;
     Found = Subject{*Call, Error, Sign};
@@ -525,19 +568,8 @@ static bool errnoConstraintHasPositiveSolution(const ResultConstraint &C) {
   return C.op == ">" || C.op == ">=";
 }
 
-static bool expectationVariable(const Expr *E) {
-  E = ignoreExpr(E);
-  const auto *Ref = dyn_cast_or_null<DeclRefExpr>(E);
-  if (!Ref)
-    return false;
-  llvm::StringRef Name = Ref->getDecl()->getName();
-  return Name == "__exp" || Name == "__seen";
-}
-
 static SVal currentValue(const Expr *Expression, CheckerContext &C) {
   SVal Value = C.getSVal(Expression);
-  if (!Value.isUnknown())
-    return Value;
   const auto *Ref = dyn_cast_or_null<DeclRefExpr>(ignoreExpr(Expression));
   const auto *Variable = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
   if (!Variable)
@@ -562,8 +594,10 @@ extractComparison(const BinaryOperator *Compare, CheckerContext &C) {
     return std::nullopt;
   SVal LHS = currentValue(Compare->getLHS(), C);
   SVal RHS = currentValue(Compare->getRHS(), C);
-  auto LeftSubject = findSubject(LHS, C.getState());
-  auto RightSubject = findSubject(RHS, C.getState());
+  auto LeftSubject = findSubject(
+      LHS, C.getState(), Compare->getLHS()->getType(), C.getASTContext());
+  auto RightSubject = findSubject(
+      RHS, C.getState(), Compare->getRHS()->getType(), C.getASTContext());
   auto LeftInteger = concreteInteger(Compare->getLHS(), LHS, C);
   auto RightInteger = concreteInteger(Compare->getRHS(), RHS, C);
   Subject S;
@@ -582,7 +616,13 @@ extractComparison(const BinaryOperator *Compare, CheckerContext &C) {
   }
   if (!Integer || Integer->getBitWidth() > 64 || Op.empty())
     return std::nullopt;
-  int64_t Value = Integer->getSExtValue();
+  if (Integer->isUnsigned() &&
+      Integer->getZExtValue() >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return std::nullopt;
+  int64_t Value = Integer->isUnsigned()
+                      ? static_cast<int64_t>(Integer->getZExtValue())
+                      : Integer->getSExtValue();
   if (S.sign < 0) {
     if (Value == INT64_MIN)
       return std::nullopt;
@@ -618,25 +658,31 @@ static std::optional<Predicate> orPredicate(const Predicate &LHS,
   return Result;
 }
 
-static std::optional<Predicate>
-extractPredicate(const Expr *Expression, bool Expected, CheckerContext &C,
-                 std::set<const VarDecl *> &Resolving, unsigned Depth = 0) {
+static bool containsConstraint(const std::optional<Predicate> &Value) {
+  if (!Value)
+    return false;
+  return std::any_of(
+      Value->begin(), Value->end(),
+      [](const ConstraintClause &Clause) { return !Clause.empty(); });
+}
+
+static std::optional<Predicate> extractPredicate(const Expr *Expression,
+                                                 bool Expected,
+                                                 CheckerContext &C,
+                                                 unsigned Depth = 0) {
   if (!Expression || Depth > 24)
     return std::nullopt;
   Expression = ignoreExpr(Expression);
 
   if (const auto *Not = dyn_cast<UnaryOperator>(Expression)) {
     if (Not->getOpcode() == UO_LNot)
-      return extractPredicate(Not->getSubExpr(), !Expected, C, Resolving,
-                              Depth + 1);
+      return extractPredicate(Not->getSubExpr(), !Expected, C, Depth + 1);
   }
 
   if (const auto *Logical = dyn_cast<BinaryOperator>(Expression)) {
     if (Logical->getOpcode() == BO_LAnd || Logical->getOpcode() == BO_LOr) {
-      auto Left = extractPredicate(Logical->getLHS(), Expected, C, Resolving,
-                                   Depth + 1);
-      auto Right = extractPredicate(Logical->getRHS(), Expected, C, Resolving,
-                                    Depth + 1);
+      auto Left = extractPredicate(Logical->getLHS(), Expected, C, Depth + 1);
+      auto Right = extractPredicate(Logical->getRHS(), Expected, C, Depth + 1);
       if (!Left || !Right)
         return std::nullopt;
       bool NeedAnd = (Logical->getOpcode() == BO_LAnd) == Expected;
@@ -663,36 +709,25 @@ extractPredicate(const Expr *Expression, bool Expected, CheckerContext &C,
 
   if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
     const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
-    if (Variable && Variable->hasInit() && Resolving.insert(Variable).second) {
-      auto Result = extractPredicate(Variable->getInit(), Expected, C,
-                                     Resolving, Depth + 1);
-      Resolving.erase(Variable);
-      return Result;
+    if (Variable) {
+      Loc Location = C.getState()->getLValue(Variable, C.getLocationContext());
+      const MemRegion *Region = Location.getAsRegion();
+      const PredicateBinding *const *Stored =
+          Region ? C.getState()->get<PredicateByRegion>(Region) : nullptr;
+      if (Stored && currentValue(Expression, C) == (*Stored)->value) {
+        const std::optional<Predicate> &Result =
+            Expected ? (*Stored)->whenTrue : (*Stored)->whenFalse;
+        return Result;
+      }
     }
   }
 
-  if (const llvm::APSInt *Integer = C.getSVal(Expression).getAsInteger()) {
+  SVal Current = currentValue(Expression, C);
+  if (const llvm::APSInt *Integer = Current.getAsInteger()) {
     bool Actual = Integer->getBoolValue();
     return Actual == Expected ? Predicate{ConstraintClause{}} : Predicate{};
   }
   return std::nullopt;
-}
-
-static std::optional<Predicate>
-extractPredicate(const Expr *Expression, bool Expected, CheckerContext &C) {
-  std::set<const VarDecl *> Resolving;
-  return extractPredicate(Expression, Expected, C, Resolving);
-}
-
-static bool containsExpectationComparison(const Expr *Expression) {
-  Expression = ignoreExpr(Expression);
-  if (const auto *Not = dyn_cast_or_null<UnaryOperator>(Expression))
-    if (Not->getOpcode() == UO_LNot)
-      return containsExpectationComparison(Not->getSubExpr());
-  const auto *Compare = dyn_cast_or_null<BinaryOperator>(Expression);
-  return Compare && Compare->isComparisonOp() &&
-         expectationVariable(Compare->getLHS()) &&
-         expectationVariable(Compare->getRHS());
 }
 
 static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
@@ -729,70 +764,17 @@ static bool knownFailureCall(const CallExpr *Call) {
          Name == "nolibc_test_failure" || Name == "test__fail";
 }
 
-static bool isFailureStatement(const Stmt *Statement, CheckerContext &C) {
-  if (!Statement)
-    return false;
+static bool knownFailureReturn(const ReturnStmt *Return, CheckerContext &C) {
+  return Return && Return->getRetValue() &&
+         failureMacroAt(Return->getRetValue()->getExprLoc(), C);
+}
+
+static bool knownFailureEvent(const Stmt *Statement, CheckerContext &C) {
   if (const auto *Return = dyn_cast<ReturnStmt>(Statement))
-    return Return->getRetValue() &&
-           failureMacroAt(Return->getRetValue()->getExprLoc(), C);
+    return knownFailureReturn(Return, C);
   if (const auto *Expression = dyn_cast<Expr>(Statement))
     return knownFailureCall(dyn_cast_or_null<CallExpr>(ignoreExpr(Expression)));
-  if (const auto *Compound = dyn_cast<CompoundStmt>(Statement)) {
-    for (const Stmt *Child : Compound->body())
-      if (isFailureStatement(Child, C))
-        return true;
-  }
   return false;
-}
-
-static bool containsStatement(const Stmt *Root, const Stmt *Needle) {
-  if (!Root)
-    return false;
-  if (Root == Needle)
-    return true;
-  for (const Stmt *Child : Root->children())
-    if (containsStatement(Child, Needle))
-      return true;
-  return false;
-}
-
-static const IfStmt *parentIf(const DynTypedNode &Node, const Stmt *Condition,
-                              ASTContext &Context, unsigned Depth = 0) {
-  if (Depth > 12)
-    return nullptr;
-  for (const DynTypedNode &Parent : Context.getParents(Node)) {
-    if (const auto *If = Parent.get<IfStmt>())
-      if (containsStatement(If->getCond(), Condition))
-        return If;
-    if (Parent.get<Stmt>())
-      if (const IfStmt *If = parentIf(Parent, Condition, Context, Depth + 1))
-        return If;
-  }
-  return nullptr;
-}
-
-static const IfStmt *parentIf(const Stmt *Condition, CheckerContext &C) {
-  if (!Condition)
-    return nullptr;
-  return parentIf(DynTypedNode::create(*Condition), Condition,
-                  C.getASTContext());
-}
-
-static std::optional<bool> successfulCondition(const Stmt *Condition,
-                                               CheckerContext &C) {
-  const auto *Expression = dyn_cast<Expr>(Condition);
-  const IfStmt *If = parentIf(Condition, C);
-  if (!Expression || !If)
-    return std::nullopt;
-  if (isFailureStatement(If->getThen(), C))
-    return false;
-  if (isFailureStatement(If->getElse(), C))
-    return true;
-  if (containsExpectationComparison(Expression) ||
-      assertionMacroAt(If->getIfLoc(), C) ||
-      assertionMacroAt(Expression->getExprLoc(), C))
-    return false;
-  return std::nullopt;
 }
 
 static bool preservesSyscallContext(const CallEvent &Call) {
@@ -800,21 +782,235 @@ static bool preservesSyscallContext(const CallEvent &Call) {
   if (!ND)
     return false;
   llvm::StringRef Name = ND->getName();
-  return Name == "syscall" || Name == "__errno_location" || Name == "fprintf" ||
-         Name == "printf" || Name == "snprintf" || Name == "puts" ||
-         Name == "fputs" || Name == "ksft_test_result" ||
-         Name == "expect_syseq" || Name == "expect_syszr" ||
-         Name == "expect_syserr";
+  return Name == "__errno_location" || Name == "fprintf" || Name == "printf" ||
+         Name == "snprintf" || Name == "puts" || Name == "fputs" ||
+         Name == "ksft_test_result" || Name == "expect_syseq" ||
+         Name == "expect_syszr" || Name == "expect_syserr";
+}
+
+struct IntegerDomain {
+  std::optional<int64_t> lower;
+  std::optional<int64_t> upper;
+  std::set<int64_t> excluded;
+  bool empty = false;
+};
+
+static void normalizeDomain(IntegerDomain &Domain) {
+  if (Domain.empty)
+    return;
+  auto Outside = [&](int64_t Value) {
+    return (Domain.lower && Value < *Domain.lower) ||
+           (Domain.upper && Value > *Domain.upper);
+  };
+  for (auto It = Domain.excluded.begin(); It != Domain.excluded.end();)
+    if (Outside(*It))
+      It = Domain.excluded.erase(It);
+    else
+      ++It;
+
+  while (Domain.lower && Domain.excluded.erase(*Domain.lower)) {
+    if (*Domain.lower == std::numeric_limits<int64_t>::max()) {
+      Domain.empty = true;
+      return;
+    }
+    ++*Domain.lower;
+  }
+  while (Domain.upper && Domain.excluded.erase(*Domain.upper)) {
+    if (*Domain.upper == std::numeric_limits<int64_t>::min()) {
+      Domain.empty = true;
+      return;
+    }
+    --*Domain.upper;
+  }
+  if (Domain.lower && Domain.upper && *Domain.lower > *Domain.upper)
+    Domain.empty = true;
+}
+
+static IntegerDomain constraintDomain(const ResultConstraint &Constraint) {
+  IntegerDomain Domain;
+  if (Constraint.op == "==") {
+    Domain.lower = Constraint.value;
+    Domain.upper = Constraint.value;
+  } else if (Constraint.op == "!=") {
+    Domain.excluded.insert(Constraint.value);
+  } else if (Constraint.op == ">") {
+    if (Constraint.value == std::numeric_limits<int64_t>::max())
+      Domain.empty = true;
+    else
+      Domain.lower = Constraint.value + 1;
+  } else if (Constraint.op == ">=") {
+    Domain.lower = Constraint.value;
+  } else if (Constraint.op == "<") {
+    if (Constraint.value == std::numeric_limits<int64_t>::min())
+      Domain.empty = true;
+    else
+      Domain.upper = Constraint.value - 1;
+  } else if (Constraint.op == "<=") {
+    Domain.upper = Constraint.value;
+  } else {
+    Domain.empty = true;
+  }
+  normalizeDomain(Domain);
+  return Domain;
+}
+
+static IntegerDomain intersectDomains(IntegerDomain LHS, IntegerDomain RHS) {
+  IntegerDomain Result;
+  Result.empty = LHS.empty || RHS.empty;
+  if (LHS.lower && RHS.lower)
+    Result.lower = std::max(*LHS.lower, *RHS.lower);
+  else
+    Result.lower = LHS.lower ? LHS.lower : RHS.lower;
+  if (LHS.upper && RHS.upper)
+    Result.upper = std::min(*LHS.upper, *RHS.upper);
+  else
+    Result.upper = LHS.upper ? LHS.upper : RHS.upper;
+  Result.excluded = std::move(LHS.excluded);
+  Result.excluded.insert(RHS.excluded.begin(), RHS.excluded.end());
+  normalizeDomain(Result);
+  return Result;
+}
+
+static std::optional<ResultConstraint>
+constraintForDomain(IntegerDomain Domain) {
+  normalizeDomain(Domain);
+  if (Domain.empty)
+    return std::nullopt;
+  if (Domain.lower && Domain.upper && *Domain.lower == *Domain.upper &&
+      Domain.excluded.empty())
+    return ResultConstraint{"==", *Domain.lower};
+  if (!Domain.excluded.empty()) {
+    if (!Domain.lower && !Domain.upper && Domain.excluded.size() == 1)
+      return ResultConstraint{"!=", *Domain.excluded.begin()};
+    return std::nullopt;
+  }
+  if (Domain.lower && !Domain.upper)
+    return ResultConstraint{">=", *Domain.lower};
+  if (!Domain.lower && Domain.upper)
+    return ResultConstraint{"<=", *Domain.upper};
+  if (Domain.lower && Domain.upper) {
+    if (*Domain.lower == std::numeric_limits<int64_t>::min())
+      return ResultConstraint{"<=", *Domain.upper};
+    if (*Domain.upper == std::numeric_limits<int64_t>::max())
+      return ResultConstraint{">=", *Domain.lower};
+  }
+  return std::nullopt;
+}
+
+static std::optional<ResultConstraint>
+mergeConstraints(const ResultConstraint &LHS, const ResultConstraint &RHS) {
+  if (LHS.op == RHS.op && LHS.value == RHS.value)
+    return LHS;
+  return constraintForDomain(
+      intersectDomains(constraintDomain(LHS), constraintDomain(RHS)));
+}
+
+static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
+  if (!namedCall(Call, "syscall") || Call.getNumArgs() < 1 ||
+      !ActiveCollector ||
+      !ActiveCollector->wantsFunction(functionName(C.getLocationContext())))
+    return false;
+  const llvm::APSInt *Number = Call.getArgSVal(0).getAsInteger();
+  return Number && Number->getBitWidth() <= 64;
 }
 
 class SyscallScenarioChecker
-    : public Checker<eval::Call, check::PreCall, check::PostStmt<UnaryOperator>,
+    : public Checker<eval::Call, check::PreCall, check::Bind,
+                     check::PreStmt<ReturnStmt>, check::PostStmt<UnaryOperator>,
                      check::PostStmt<ImplicitCastExpr>,
                      check::PostStmt<BinaryOperator>, check::BeginFunction,
                      check::EndFunction, check::BranchCondition> {
-  static bool equalConstraint(const ResultConstraint &LHS,
-                              const ResultConstraint &RHS) {
-    return LHS.op == RHS.op && LHS.value == RHS.value;
+  using CFGKey = std::pair<const Decl *, const CFG *>;
+  mutable std::map<CFGKey, std::set<const CFGBlock *>> FailureBlocks;
+
+  const std::set<const CFGBlock *> &failureBlocks(const CFG &Graph,
+                                                  CheckerContext &C) const {
+    CFGKey Key{C.getCurrentAnalysisDeclContext()->getDecl(), &Graph};
+    auto [It, Inserted] = FailureBlocks.try_emplace(Key);
+    if (!Inserted)
+      return It->second;
+
+    std::set<const CFGBlock *> &Result = It->second;
+    for (const CFGBlock *Block : Graph) {
+      for (const CFGElement &Element : *Block) {
+        auto Statement = Element.getAs<CFGStmt>();
+        if (Statement && knownFailureEvent(Statement->getStmt(), C)) {
+          Result.insert(Block);
+          break;
+        }
+      }
+    }
+
+    // Least fixed point: a block is definitely failing when it contains a
+    // failure event, or every reachable successor is already definitely
+    // failing. Cycles without a failure remain outside the set.
+    bool Changed;
+    do {
+      Changed = false;
+      for (const CFGBlock *Block : Graph) {
+        if (Result.count(Block) || Block == &Graph.getExit())
+          continue;
+        bool HasSuccessor = false;
+        bool AllFail = true;
+        for (const CFGBlock::AdjacentBlock &Adjacent : Block->succs()) {
+          const CFGBlock *Successor = Adjacent.getReachableBlock();
+          if (!Successor)
+            continue;
+          HasSuccessor = true;
+          AllFail &= Result.count(Successor) != 0;
+        }
+        if (HasSuccessor && AllFail) {
+          Result.insert(Block);
+          Changed = true;
+        }
+      }
+    } while (Changed);
+    return Result;
+  }
+
+  std::optional<bool> successfulCondition(const Stmt *Condition,
+                                          CheckerContext &C) const {
+    const auto *Expression = dyn_cast_or_null<Expr>(Condition);
+    const CFGBlock *Block = C.getCFGElementRef().getParent();
+    if (!Expression || !Block)
+      return std::nullopt;
+
+    if (const auto *If = dyn_cast_or_null<IfStmt>(Block->getTerminatorStmt())) {
+      if (ignoreExpr(Expression) == ignoreExpr(If->getCond()) &&
+          (assertionMacroAt(If->getIfLoc(), C) ||
+           assertionMacroAt(Expression->getExprLoc(), C)))
+        return false;
+    }
+
+    if (Block->succ_size() != 2)
+      return std::nullopt;
+    const CFG &Graph = *Block->getParent();
+    const std::set<const CFGBlock *> &Failures = failureBlocks(Graph, C);
+    auto Successor = Block->succ_begin();
+    const CFGBlock *WhenTrue = Successor->getReachableBlock();
+    ++Successor;
+    const CFGBlock *WhenFalse = Successor->getReachableBlock();
+    bool TrueFails = WhenTrue && Failures.count(WhenTrue);
+    bool FalseFails = WhenFalse && Failures.count(WhenFalse);
+    if (TrueFails == FalseFails)
+      return std::nullopt;
+    return !TrueFails;
+  }
+
+  static const Expr *bindingSource(const VarDecl *Variable,
+                                   const Stmt *Statement) {
+    if (const auto *Declaration = dyn_cast_or_null<DeclStmt>(Statement)) {
+      for (const Decl *D : Declaration->decls()) {
+        const auto *BoundVariable = dyn_cast<VarDecl>(D);
+        if (BoundVariable == Variable)
+          return BoundVariable->getInit();
+      }
+      return nullptr;
+    }
+    const auto *Assignment = dyn_cast_or_null<BinaryOperator>(Statement);
+    if (Assignment && Assignment->getOpcode() == BO_Assign)
+      return Assignment->getRHS();
+    return nullptr;
   }
 
   static ProgramStateRef applyClause(ProgramStateRef State,
@@ -826,9 +1022,14 @@ class SyscallScenarioChecker
         Updated = **Old;
       std::optional<ResultConstraint> &Slot =
           Pending.subject.error ? Updated.error : Updated.ret;
-      if (Slot && !equalConstraint(*Slot, Pending.result))
-        continue;
-      Slot = Pending.result;
+      if (Slot) {
+        auto Merged = mergeConstraints(*Slot, Pending.result);
+        if (!Merged)
+          return nullptr;
+        Slot = std::move(*Merged);
+      } else {
+        Slot = Pending.result;
+      }
       const ConstraintSet *Stored =
           ActiveCollector->makeConstraints(std::move(Updated));
       State = State->set<ConstraintsByCall>(Pending.subject.call, Stored);
@@ -841,11 +1042,14 @@ class SyscallScenarioChecker
     auto Extracted = extractPredicate(Expression, Expected, C);
     if (!Extracted)
       return false;
-    bool HasConstraint = false;
-    for (const ConstraintClause &Clause : *Extracted)
-      HasConstraint |= !Clause.empty();
-    if (!HasConstraint)
+    if (Extracted->empty())
       return false;
+    // If one successful alternative imposes no syscall constraint, emitting
+    // only the narrower alternatives would invent an oracle the test does not
+    // actually require (for example, `ret == 0 || true`).
+    for (const ConstraintClause &Clause : *Extracted)
+      if (Clause.empty())
+        return false;
 
     ProgramStateRef Base = C.getState();
     if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
@@ -853,19 +1057,51 @@ class SyscallScenarioChecker
       if (!Base)
         return true;
     }
-    for (const ConstraintClause &Clause : *Extracted)
-      if (ProgramStateRef Next = applyClause(Base, Clause))
+    bool Added = false;
+    for (const ConstraintClause &Clause : *Extracted) {
+      if (ProgramStateRef Next = applyClause(Base, Clause)) {
         C.addTransition(Next);
-    return true;
+        Added = true;
+      }
+    }
+    return Added;
   }
 
 public:
+  void checkBind(SVal Location, SVal Value, const Stmt *Statement,
+                 CheckerContext &C) const {
+    const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());
+    const VarDecl *Variable = Region ? Region->getDecl() : nullptr;
+    if (!Variable)
+      return;
+
+    ProgramStateRef State = C.getState();
+    if (State->get<PredicateByRegion>(Region))
+      State = State->remove<PredicateByRegion>(Region);
+
+    const Expr *Source = bindingSource(Variable, Statement);
+    if (Source && ActiveCollector) {
+      std::optional<Predicate> WhenTrue = extractPredicate(Source, true, C);
+      std::optional<Predicate> WhenFalse = extractPredicate(Source, false, C);
+      if (containsConstraint(WhenTrue) || containsConstraint(WhenFalse)) {
+        const PredicateBinding *Binding = ActiveCollector->makePredicateBinding(
+            {Value, std::move(WhenTrue), std::move(WhenFalse)});
+        State = State->set<PredicateByRegion>(Region, Binding);
+      }
+    }
+    if (State != C.getState())
+      C.addTransition(State);
+  }
+
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
-    if (!namedCall(Call, "syscall") || Call.getNumArgs() < 1)
+    if (knownFailureCall(
+            dyn_cast_or_null<CallExpr>(ignoreExpr(Call.getOriginExpr())))) {
+      C.addSink();
+      return true;
+    }
+    if (!modelableSyscall(Call, C))
       return false;
     llvm::StringRef Function = functionName(C.getLocationContext());
-    if (!ActiveCollector || !ActiveCollector->wantsFunction(Function))
-      return false;
 
     const llvm::APSInt *NumberValue = Call.getArgSVal(0).getAsInteger();
     if (!NumberValue || NumberValue->getBitWidth() > 64)
@@ -895,9 +1131,14 @@ public:
     ProgramStateRef State = C.getState()->BindExpr(
         Call.getOriginExpr(), C.getLocationContext(), Return);
     State = State->set<SyscallBySymbol>(Symbol, Stored);
-    State = State->set<LastSyscall>(Stored);
+    State = State->set<CurrentErrnoOwner>(Stored);
     C.addTransition(State);
     return true;
+  }
+
+  void checkPreStmt(const ReturnStmt *Return, CheckerContext &C) const {
+    if (knownFailureReturn(Return, C))
+      C.addSink();
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
@@ -906,11 +1147,18 @@ public:
         if (applyPredicate(Condition, true, C))
           return;
     }
+    if (namedCall(Call, "syscall")) {
+      if (modelableSyscall(Call, C))
+        return;
+      if (C.getState()->get<CurrentErrnoOwner>())
+        C.addTransition(C.getState()->remove<CurrentErrnoOwner>());
+      return;
+    }
     if (preservesSyscallContext(Call))
       return;
-    if (!C.getState()->get<LastSyscall>())
+    if (!C.getState()->get<CurrentErrnoOwner>())
       return;
-    C.addTransition(C.getState()->remove<LastSyscall>());
+    C.addTransition(C.getState()->remove<CurrentErrnoOwner>());
   }
 
   void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
@@ -930,13 +1178,13 @@ public:
     const FunctionDecl *FD = CE ? CE->getDirectCallee() : nullptr;
     if (!FD || FD->getName() != "__errno_location")
       return;
-    const Invocation *Last = C.getState()->get<LastSyscall>();
-    if (!Last)
+    const Invocation *Owner = C.getState()->get<CurrentErrnoOwner>();
+    if (!Owner)
       return;
     ProgramStateRef State = C.getState();
     bool Changed = false;
     for (SymbolRef Atom : C.getSVal(UO).symbols()) {
-      State = State->set<ErrnoBySymbol>(Atom, Last);
+      State = State->set<ErrnoBySymbol>(Atom, Owner);
       Changed = true;
     }
     if (Changed)
@@ -952,13 +1200,13 @@ public:
       return;
     const auto *CE = dyn_cast_or_null<CallExpr>(ignoreExpr(UO->getSubExpr()));
     const FunctionDecl *FD = CE ? CE->getDirectCallee() : nullptr;
-    const Invocation *Last = C.getState()->get<LastSyscall>();
-    if (!FD || FD->getName() != "__errno_location" || !Last)
+    const Invocation *Owner = C.getState()->get<CurrentErrnoOwner>();
+    if (!FD || FD->getName() != "__errno_location" || !Owner)
       return;
     ProgramStateRef State = C.getState();
     bool Changed = false;
     for (SymbolRef Atom : C.getSVal(Cast).symbols()) {
-      State = State->set<ErrnoBySymbol>(Atom, Last);
+      State = State->set<ErrnoBySymbol>(Atom, Owner);
       Changed = true;
     }
     if (Changed)

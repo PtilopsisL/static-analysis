@@ -490,5 +490,75 @@
       }
     },
     "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      600,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": ">=",
+        "value": 1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      606,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": -1
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      610,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      611,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      614,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
   }
 ]

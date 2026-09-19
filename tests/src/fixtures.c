@@ -5,11 +5,13 @@
 #define EIO 5
 #define ESRCH 3
 #define EINVAL 22
+#define KSFT_FAIL 1
 #define errno (*__errno_location())
 
 extern int *__errno_location(void) __attribute__((const));
 extern long syscall(long number, ...);
 extern int fprintf(void *stream, const char *format, ...);
+extern int puts(const char *string);
 extern void *stderr;
 
 struct open_how {
@@ -38,6 +40,9 @@ struct open_how {
 extern void unrelated_call(void);
 extern int unknown_value(void);
 extern void mutate(int *value);
+extern void abort(void) __attribute__((noreturn));
+extern void exit_success(void) __attribute__((noreturn));
+extern void ksft_test_result(int condition, const char *format, ...);
 
 static long getfd(int pidfd, int fd, unsigned flags) {
   return syscall(__NR_pidfd_getfd, pidfd, fd, flags);
@@ -137,3 +142,111 @@ TEST(command_line_define) {
   EXPECT_EQ(getfd(COMPDB_PIDFD, 0, 1), -1);
 }
 #endif
+
+
+/* Correctness regressions: these cases must not be weakened into false records. */
+TEST(compound_constraint_strengthening) {
+  long ret = getfd(600, 0, 0);
+  ksft_test_result(ret >= 0 && ret >= 1, "stronger lower bound\n");
+}
+
+TEST(unrepresentable_range) {
+  long ret = getfd(601, 0, 0);
+  ksft_test_result(ret >= 0 && ret < 10, "bounded range\n");
+}
+
+TEST(unconstrained_success_alternative) {
+  long ret = getfd(602, 0, 0);
+  ksft_test_result(ret == 0 || 1, "always succeeds\n");
+}
+
+TEST(reassigned_predicate_variable) {
+  long ret = getfd(603, 0, 0);
+  int ok = ret == 0;
+  ok = 1;
+  if (!ok)
+    abort();
+}
+
+TEST(assertion_temporary_lookalike) {
+  long __exp = getfd(604, 0, 0);
+  long __seen = 0;
+  if (!(__exp == __seen)) {
+  }
+}
+
+TEST(nested_possible_failure) {
+  long ret = getfd(605, 0, 0);
+  if (ret != 0) {
+    if (unknown_value())
+      abort();
+  }
+}
+
+static void unmodeled_syscall_number(long number) {
+  long ret = getfd(606, 0, 0);
+  EXPECT_EQ(ret, -1);
+  syscall(number, 0);
+  EXPECT_EQ(errno, EINVAL);
+}
+
+TEST(unsigned_cast_ordering) {
+  unsigned long ret = (unsigned long)getfd(607, 0, 0);
+  ksft_test_result(ret < 5, "unsigned result is small\n");
+}
+
+static int compound_failure_condition(long gate) {
+  long ret = getfd(608, 0, 0);
+  if (ret != 0 && gate)
+    return KSFT_FAIL;
+  return 0;
+}
+
+static int both_branches_fail(void) {
+  long ret = getfd(609, 0, 0);
+  if (ret == 0)
+    return KSFT_FAIL;
+  else
+    return KSFT_FAIL;
+}
+
+TEST(predicate_reassigned_after_assertion) {
+  long ret = getfd(610, 0, 0);
+  int ok = ret == 0;
+  if (!ok)
+    abort();
+  ok = 1;
+}
+
+TEST(definite_failure_via_cfg) {
+  long ret = getfd(611, 0, 0);
+  if (ret != 0) {
+    if (unknown_value())
+      puts("first path");
+    else
+      puts("second path");
+    abort();
+  }
+}
+
+TEST(predicate_invalidated_by_opaque_write) {
+  long ret = getfd(612, 0, 0);
+  int ok = ret == 0;
+  mutate(&ok);
+  if (!ok)
+    abort();
+}
+
+TEST(unknown_noreturn_is_not_failure) {
+  long ret = getfd(613, 0, 0);
+  if (ret != 0)
+    exit_success();
+}
+
+TEST(predicate_assignment_tracks_new_value) {
+  long ret = getfd(614, 0, 0);
+  int ok = 1;
+  ok = ret == 0;
+  if (!ok)
+    abort();
+}
