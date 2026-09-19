@@ -189,6 +189,18 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(record["args"], [614, 0, 0])
         self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
 
+    def test_unrepresentable_intermediate_domain_can_be_refined(self):
+        record, = self.extract("domain_refinement_becomes_projectable")["records"]
+        self.assertEqual(record["args"], [615, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 5}})
+
+    def test_clang_path_constraint_is_the_primary_domain(self):
+        record, = self.extract("clang_path_constraint_strengthens_assertion")[
+            "records"
+        ]
+        self.assertEqual(record["args"], [616, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": ">=", "value": 1}})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

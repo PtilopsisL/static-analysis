@@ -250,3 +250,15 @@ TEST(predicate_assignment_tracks_new_value) {
   if (!ok)
     abort();
 }
+
+TEST(domain_refinement_becomes_projectable) {
+  long ret = getfd(615, 0, 0);
+  ksft_test_result(ret >= 0 && ret < 10 && ret == 5,
+                   "bounded result is refined to a point\n");
+}
+
+TEST(clang_path_constraint_strengthens_assertion) {
+  long ret = getfd(616, 0, 0);
+  if (ret >= 1)
+    ksft_test_result(ret >= 0, "non-negative result\n");
+}

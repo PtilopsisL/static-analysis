@@ -28,6 +28,7 @@
 #include <clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h>
+#include <clang/StaticAnalyzer/Core/PathSensitive/RangedConstraintManager.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/SValBuilder.h>
 #include <clang/StaticAnalyzer/Core/PathSensitive/SymbolManager.h>
 #include <clang/StaticAnalyzer/Frontend/AnalysisConsumer.h>
@@ -111,6 +112,208 @@ struct ResultConstraint {
   int64_t value = 0;
 };
 
+struct IntegerDomain {
+  std::optional<int64_t> lower;
+  std::optional<int64_t> upper;
+  std::set<int64_t> excluded;
+  bool empty = false;
+};
+
+static void normalizeDomain(IntegerDomain &Domain) {
+  if (Domain.empty)
+    return;
+  auto Outside = [&](int64_t Value) {
+    return (Domain.lower && Value < *Domain.lower) ||
+           (Domain.upper && Value > *Domain.upper);
+  };
+  for (auto It = Domain.excluded.begin(); It != Domain.excluded.end();)
+    if (Outside(*It))
+      It = Domain.excluded.erase(It);
+    else
+      ++It;
+
+  while (Domain.lower && Domain.excluded.erase(*Domain.lower)) {
+    if (*Domain.lower == std::numeric_limits<int64_t>::max()) {
+      Domain.empty = true;
+      return;
+    }
+    ++*Domain.lower;
+  }
+  while (Domain.upper && Domain.excluded.erase(*Domain.upper)) {
+    if (*Domain.upper == std::numeric_limits<int64_t>::min()) {
+      Domain.empty = true;
+      return;
+    }
+    --*Domain.upper;
+  }
+  if (Domain.lower && Domain.upper && *Domain.lower > *Domain.upper)
+    Domain.empty = true;
+}
+
+static IntegerDomain constraintDomain(const ResultConstraint &Constraint) {
+  IntegerDomain Domain;
+  if (Constraint.op == "==") {
+    Domain.lower = Constraint.value;
+    Domain.upper = Constraint.value;
+  } else if (Constraint.op == "!=") {
+    Domain.excluded.insert(Constraint.value);
+  } else if (Constraint.op == ">") {
+    if (Constraint.value == std::numeric_limits<int64_t>::max())
+      Domain.empty = true;
+    else
+      Domain.lower = Constraint.value + 1;
+  } else if (Constraint.op == ">=") {
+    Domain.lower = Constraint.value;
+  } else if (Constraint.op == "<") {
+    if (Constraint.value == std::numeric_limits<int64_t>::min())
+      Domain.empty = true;
+    else
+      Domain.upper = Constraint.value - 1;
+  } else if (Constraint.op == "<=") {
+    Domain.upper = Constraint.value;
+  } else {
+    Domain.empty = true;
+  }
+  normalizeDomain(Domain);
+  return Domain;
+}
+
+static IntegerDomain intersectDomains(IntegerDomain LHS, IntegerDomain RHS) {
+  IntegerDomain Result;
+  Result.empty = LHS.empty || RHS.empty;
+  if (LHS.lower && RHS.lower)
+    Result.lower = std::max(*LHS.lower, *RHS.lower);
+  else
+    Result.lower = LHS.lower ? LHS.lower : RHS.lower;
+  if (LHS.upper && RHS.upper)
+    Result.upper = std::min(*LHS.upper, *RHS.upper);
+  else
+    Result.upper = LHS.upper ? LHS.upper : RHS.upper;
+  Result.excluded = std::move(LHS.excluded);
+  Result.excluded.insert(RHS.excluded.begin(), RHS.excluded.end());
+  normalizeDomain(Result);
+  return Result;
+}
+
+static bool domainHasPositiveSolution(IntegerDomain Domain) {
+  normalizeDomain(Domain);
+  if (Domain.empty || (Domain.upper && *Domain.upper < 1))
+    return false;
+  int64_t Candidate = std::max<int64_t>(Domain.lower.value_or(1), 1);
+  while (Domain.excluded.count(Candidate)) {
+    if (Candidate == std::numeric_limits<int64_t>::max())
+      return false;
+    ++Candidate;
+  }
+  return !Domain.upper || Candidate <= *Domain.upper;
+}
+
+static std::optional<ResultConstraint>
+constraintForDomain(IntegerDomain Domain) {
+  normalizeDomain(Domain);
+  if (Domain.empty)
+    return std::nullopt;
+  if (Domain.lower && Domain.upper && *Domain.lower == *Domain.upper &&
+      Domain.excluded.empty())
+    return ResultConstraint{"==", *Domain.lower};
+  if (!Domain.excluded.empty()) {
+    if (!Domain.lower && !Domain.upper && Domain.excluded.size() == 1)
+      return ResultConstraint{"!=", *Domain.excluded.begin()};
+    return std::nullopt;
+  }
+  if (Domain.lower && !Domain.upper)
+    return ResultConstraint{">=", *Domain.lower};
+  if (!Domain.lower && Domain.upper)
+    return ResultConstraint{"<=", *Domain.upper};
+  if (Domain.lower && Domain.upper) {
+    if (*Domain.lower == std::numeric_limits<int64_t>::min())
+      return ResultConstraint{"<=", *Domain.upper};
+    if (*Domain.upper == std::numeric_limits<int64_t>::max())
+      return ResultConstraint{">=", *Domain.lower};
+  }
+  return std::nullopt;
+}
+
+enum class ProjectionKind {
+  Exact,
+  Unconstrained,
+  Unsatisfiable,
+  Unrepresentable,
+};
+
+struct DomainProjection {
+  ProjectionKind kind;
+  std::optional<ResultConstraint> constraint;
+};
+
+static DomainProjection
+projectDomain(const std::optional<IntegerDomain> &Stored) {
+  if (!Stored)
+    return {ProjectionKind::Unconstrained, std::nullopt};
+  IntegerDomain Domain = *Stored;
+  normalizeDomain(Domain);
+  if (Domain.empty)
+    return {ProjectionKind::Unsatisfiable, std::nullopt};
+  if (!Domain.lower && !Domain.upper && Domain.excluded.empty())
+    return {ProjectionKind::Unconstrained, std::nullopt};
+  if (auto Constraint = constraintForDomain(Domain))
+    return {ProjectionKind::Exact, std::move(Constraint)};
+  return {ProjectionKind::Unrepresentable, std::nullopt};
+}
+
+static std::optional<int64_t> signedDomainValue(const llvm::APSInt &Value) {
+  if (Value.getBitWidth() > 64 || Value.isUnsigned())
+    return std::nullopt;
+  return Value.getSExtValue();
+}
+
+static std::optional<IntegerDomain> domainForRangeSet(const RangeSet &Ranges) {
+  IntegerDomain Domain;
+  if (Ranges.isEmpty()) {
+    Domain.empty = true;
+    return Domain;
+  }
+  APSIntType Type = Ranges.getAPSIntType();
+  if (Type.getBitWidth() > 64 || Type.isUnsigned())
+    return std::nullopt;
+  auto TypeMin = signedDomainValue(Type.getMinValue());
+  auto TypeMax = signedDomainValue(Type.getMaxValue());
+  if (!TypeMin || !TypeMax)
+    return std::nullopt;
+
+  bool First = true;
+  int64_t PreviousUpper = 0;
+  for (const Range &R : Ranges) {
+    auto Lower = signedDomainValue(R.From());
+    auto Upper = signedDomainValue(R.To());
+    if (!Lower || !Upper)
+      return std::nullopt;
+    if (First) {
+      if (*Lower != *TypeMin)
+        Domain.lower = *Lower;
+      First = false;
+    } else {
+      __int128 GapSize = static_cast<__int128>(*Lower) - PreviousUpper - 1;
+      // IntegerDomain represents holes as excluded points. Large gaps remain
+      // on the conservative fallback until RangeSet becomes the native state.
+      if (GapSize < 0 || GapSize > 64)
+        return std::nullopt;
+      for (int64_t Value = PreviousUpper + 1; Value < *Lower; ++Value)
+        Domain.excluded.insert(Value);
+    }
+    PreviousUpper = *Upper;
+  }
+  if (PreviousUpper != *TypeMax)
+    Domain.upper = PreviousUpper;
+  normalizeDomain(Domain);
+  return Domain;
+}
+
+struct ConstraintDomains {
+  std::optional<IntegerDomain> ret;
+  std::optional<IntegerDomain> error;
+};
+
 struct ConstraintSet {
   std::optional<ResultConstraint> ret;
   std::optional<ResultConstraint> error;
@@ -127,6 +330,7 @@ struct Subject {
   const Invocation *call = nullptr;
   bool error = false;
   int sign = 1;
+  SymbolRef symbol = nullptr;
 };
 
 struct PendingConstraint {
@@ -155,7 +359,7 @@ class Collector {
   std::set<std::string> SelectedFunctions;
   std::set<std::string> SelectedSyscalls;
   std::vector<std::unique_ptr<Invocation>> Invocations;
-  std::vector<std::unique_ptr<ConstraintSet>> Constraints;
+  std::vector<std::unique_ptr<ConstraintDomains>> ConstraintDomainStorage;
   std::vector<std::unique_ptr<PendingConstraint>> PendingConstraints;
   std::vector<std::unique_ptr<PredicateBinding>> PredicateBindings;
   std::set<std::string> SeenFunctions;
@@ -210,9 +414,10 @@ public:
     return Invocations.back().get();
   }
 
-  const ConstraintSet *makeConstraints(ConstraintSet Value) {
-    Constraints.push_back(std::make_unique<ConstraintSet>(std::move(Value)));
-    return Constraints.back().get();
+  const ConstraintDomains *makeConstraintDomains(ConstraintDomains Value) {
+    ConstraintDomainStorage.push_back(
+        std::make_unique<ConstraintDomains>(std::move(Value)));
+    return ConstraintDomainStorage.back().get();
   }
 
   const PendingConstraint *makePendingConstraint(PendingConstraint Value) {
@@ -227,9 +432,22 @@ public:
     return PredicateBindings.back().get();
   }
 
-  void emit(const Invocation *Call, const ConstraintSet *Result) {
-    if (!Call || !Result || !Call->concrete || !wantsFunction(Call->function) ||
-        !wantsSyscall(Call->syscall) || (!Result->ret && !Result->error))
+  void emit(const Invocation *Call, const ConstraintDomains *Domains) {
+    if (!Call || !Domains || !Call->concrete ||
+        !wantsFunction(Call->function) || !wantsSyscall(Call->syscall))
+      return;
+
+    DomainProjection Ret = projectDomain(Domains->ret);
+    DomainProjection Error = projectDomain(Domains->error);
+    auto CannotEmit = [](ProjectionKind Kind) {
+      return Kind == ProjectionKind::Unsatisfiable ||
+             Kind == ProjectionKind::Unrepresentable;
+    };
+    if (CannotEmit(Ret.kind) || CannotEmit(Error.kind))
+      return;
+    ConstraintSet Result{std::move(Ret.constraint),
+                         std::move(Error.constraint)};
+    if (!Result.ret && !Result.error)
       return;
 
     json::Array BaseArgs;
@@ -242,9 +460,9 @@ public:
         ++It;
         continue;
       }
-      if (subset(*Result, It->result))
+      if (subset(Result, It->result))
         return;
-      if (subset(It->result, *Result)) {
+      if (subset(It->result, Result)) {
         It = Records.erase(It);
         continue;
       }
@@ -255,11 +473,11 @@ public:
     for (const ConcreteValue &Arg : Call->args)
       Args.push_back(toJSON(Arg));
     json::Object ResultObject;
-    if (Result->ret)
-      ResultObject["ret"] = constraintJSON(*Result->ret);
-    if (Result->error) {
-      ResultObject["errno"] = constraintJSON(*Result->error);
-      if (!Result->ret)
+    if (Result.ret)
+      ResultObject["ret"] = constraintJSON(*Result.ret);
+    if (Result.error) {
+      ResultObject["errno"] = constraintJSON(*Result.error);
+      if (!Result.ret)
         ResultObject["ret"] = constraintJSON({"==", -1});
     }
     json::Object Record{{"syscall", Call->syscall},
@@ -267,7 +485,7 @@ public:
                         {"result", std::move(ResultObject)}};
     std::string FullKey = render(json::Object(Record));
     Records.push_back({Call->function, std::move(BaseKey), std::move(FullKey),
-                       *Result, std::move(Record)});
+                       std::move(Result), std::move(Record)});
   }
 
   json::Array functionJSON() const {
@@ -304,7 +522,7 @@ static Collector *ActiveCollector = nullptr;
 REGISTER_MAP_WITH_PROGRAMSTATE(SyscallBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ErrnoBySymbol, SymbolRef, const Invocation *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintsByCall, const Invocation *,
-                               const ConstraintSet *)
+                               const ConstraintDomains *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintByComparison, const BinaryOperator *,
                                const PendingConstraint *)
 REGISTER_MAP_WITH_PROGRAMSTATE(PredicateByRegion, const MemRegion *,
@@ -483,9 +701,9 @@ static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
                                           Context))
       return std::nullopt;
     int Sign = signOf(Expression, Atom, Context);
-    if (!Sign || (Found && Found->call != *Call))
+    if (!Sign || (Found && (Found->call != *Call || Found->symbol != Atom)))
       return std::nullopt;
-    Found = Subject{*Call, Error, Sign};
+    Found = Subject{*Call, Error, Sign, Atom};
   }
   return Found;
 }
@@ -554,18 +772,6 @@ static std::string negateTruth(std::string Op) {
   if (Op == ">=")
     return "<";
   return {};
-}
-
-static bool errnoConstraintHasPositiveSolution(const ResultConstraint &C) {
-  if (C.op == "==")
-    return C.value > 0;
-  if (C.op == "!=")
-    return true;
-  if (C.op == "<")
-    return C.value > 1;
-  if (C.op == "<=")
-    return C.value >= 1;
-  return C.op == ">" || C.op == ">=";
 }
 
 static SVal currentValue(const Expr *Expression, CheckerContext &C) {
@@ -701,7 +907,7 @@ static std::optional<Predicate> extractPredicate(const Expr *Expression,
       if (!Expected)
         Pending->result.op = negateTruth(std::move(Pending->result.op));
       if (Pending->subject.error &&
-          !errnoConstraintHasPositiveSolution(Pending->result))
+          !domainHasPositiveSolution(constraintDomain(Pending->result)))
         return std::nullopt;
       return Predicate{{std::move(*Pending)}};
     }
@@ -788,123 +994,6 @@ static bool preservesSyscallContext(const CallEvent &Call) {
          Name == "expect_syszr" || Name == "expect_syserr";
 }
 
-struct IntegerDomain {
-  std::optional<int64_t> lower;
-  std::optional<int64_t> upper;
-  std::set<int64_t> excluded;
-  bool empty = false;
-};
-
-static void normalizeDomain(IntegerDomain &Domain) {
-  if (Domain.empty)
-    return;
-  auto Outside = [&](int64_t Value) {
-    return (Domain.lower && Value < *Domain.lower) ||
-           (Domain.upper && Value > *Domain.upper);
-  };
-  for (auto It = Domain.excluded.begin(); It != Domain.excluded.end();)
-    if (Outside(*It))
-      It = Domain.excluded.erase(It);
-    else
-      ++It;
-
-  while (Domain.lower && Domain.excluded.erase(*Domain.lower)) {
-    if (*Domain.lower == std::numeric_limits<int64_t>::max()) {
-      Domain.empty = true;
-      return;
-    }
-    ++*Domain.lower;
-  }
-  while (Domain.upper && Domain.excluded.erase(*Domain.upper)) {
-    if (*Domain.upper == std::numeric_limits<int64_t>::min()) {
-      Domain.empty = true;
-      return;
-    }
-    --*Domain.upper;
-  }
-  if (Domain.lower && Domain.upper && *Domain.lower > *Domain.upper)
-    Domain.empty = true;
-}
-
-static IntegerDomain constraintDomain(const ResultConstraint &Constraint) {
-  IntegerDomain Domain;
-  if (Constraint.op == "==") {
-    Domain.lower = Constraint.value;
-    Domain.upper = Constraint.value;
-  } else if (Constraint.op == "!=") {
-    Domain.excluded.insert(Constraint.value);
-  } else if (Constraint.op == ">") {
-    if (Constraint.value == std::numeric_limits<int64_t>::max())
-      Domain.empty = true;
-    else
-      Domain.lower = Constraint.value + 1;
-  } else if (Constraint.op == ">=") {
-    Domain.lower = Constraint.value;
-  } else if (Constraint.op == "<") {
-    if (Constraint.value == std::numeric_limits<int64_t>::min())
-      Domain.empty = true;
-    else
-      Domain.upper = Constraint.value - 1;
-  } else if (Constraint.op == "<=") {
-    Domain.upper = Constraint.value;
-  } else {
-    Domain.empty = true;
-  }
-  normalizeDomain(Domain);
-  return Domain;
-}
-
-static IntegerDomain intersectDomains(IntegerDomain LHS, IntegerDomain RHS) {
-  IntegerDomain Result;
-  Result.empty = LHS.empty || RHS.empty;
-  if (LHS.lower && RHS.lower)
-    Result.lower = std::max(*LHS.lower, *RHS.lower);
-  else
-    Result.lower = LHS.lower ? LHS.lower : RHS.lower;
-  if (LHS.upper && RHS.upper)
-    Result.upper = std::min(*LHS.upper, *RHS.upper);
-  else
-    Result.upper = LHS.upper ? LHS.upper : RHS.upper;
-  Result.excluded = std::move(LHS.excluded);
-  Result.excluded.insert(RHS.excluded.begin(), RHS.excluded.end());
-  normalizeDomain(Result);
-  return Result;
-}
-
-static std::optional<ResultConstraint>
-constraintForDomain(IntegerDomain Domain) {
-  normalizeDomain(Domain);
-  if (Domain.empty)
-    return std::nullopt;
-  if (Domain.lower && Domain.upper && *Domain.lower == *Domain.upper &&
-      Domain.excluded.empty())
-    return ResultConstraint{"==", *Domain.lower};
-  if (!Domain.excluded.empty()) {
-    if (!Domain.lower && !Domain.upper && Domain.excluded.size() == 1)
-      return ResultConstraint{"!=", *Domain.excluded.begin()};
-    return std::nullopt;
-  }
-  if (Domain.lower && !Domain.upper)
-    return ResultConstraint{">=", *Domain.lower};
-  if (!Domain.lower && Domain.upper)
-    return ResultConstraint{"<=", *Domain.upper};
-  if (Domain.lower && Domain.upper) {
-    if (*Domain.lower == std::numeric_limits<int64_t>::min())
-      return ResultConstraint{"<=", *Domain.upper};
-    if (*Domain.upper == std::numeric_limits<int64_t>::max())
-      return ResultConstraint{">=", *Domain.lower};
-  }
-  return std::nullopt;
-}
-
-static std::optional<ResultConstraint>
-mergeConstraints(const ResultConstraint &LHS, const ResultConstraint &RHS) {
-  if (LHS.op == RHS.op && LHS.value == RHS.value)
-    return LHS;
-  return constraintForDomain(
-      intersectDomains(constraintDomain(LHS), constraintDomain(RHS)));
-}
-
 static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
   if (!namedCall(Call, "syscall") || Call.getNumArgs() < 1 ||
       !ActiveCollector ||
@@ -915,11 +1004,11 @@ static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
 }
 
 class SyscallScenarioChecker
-    : public Checker<eval::Call, check::PreCall, check::Bind,
-                     check::PreStmt<ReturnStmt>, check::PostStmt<UnaryOperator>,
-                     check::PostStmt<ImplicitCastExpr>,
-                     check::PostStmt<BinaryOperator>, check::BeginFunction,
-                     check::EndFunction, check::BranchCondition> {
+    : public Checker<
+          eval::Call, check::PreCall, check::Bind, check::LiveSymbols,
+          check::PreStmt<ReturnStmt>, check::PostStmt<UnaryOperator>,
+          check::PostStmt<ImplicitCastExpr>, check::PostStmt<BinaryOperator>,
+          check::BeginFunction, check::EndFunction, check::BranchCondition> {
   using CFGKey = std::pair<const Decl *, const CFG *>;
   mutable std::map<CFGKey, std::set<const CFGBlock *>> FailureBlocks;
 
@@ -1014,24 +1103,29 @@ class SyscallScenarioChecker
   }
 
   static ProgramStateRef applyClause(ProgramStateRef State,
-                                     const ConstraintClause &Clause) {
+                                     const ConstraintClause &Clause,
+                                     const ConstraintMap &ClangConstraints) {
     for (const PendingConstraint &Pending : Clause) {
-      ConstraintSet Updated;
-      if (const ConstraintSet *const *Old =
+      ConstraintDomains Updated;
+      if (const ConstraintDomains *const *Old =
               State->get<ConstraintsByCall>(Pending.subject.call))
         Updated = **Old;
-      std::optional<ResultConstraint> &Slot =
+      std::optional<IntegerDomain> &Slot =
           Pending.subject.error ? Updated.error : Updated.ret;
-      if (Slot) {
-        auto Merged = mergeConstraints(*Slot, Pending.result);
-        if (!Merged)
-          return nullptr;
-        Slot = std::move(*Merged);
-      } else {
-        Slot = Pending.result;
-      }
-      const ConstraintSet *Stored =
-          ActiveCollector->makeConstraints(std::move(Updated));
+      std::optional<IntegerDomain> ClangDomain;
+      if (Pending.subject.symbol)
+        if (const RangeSet *Ranges =
+                ClangConstraints.lookup(Pending.subject.symbol))
+          ClangDomain = domainForRangeSet(*Ranges);
+      IntegerDomain Incoming =
+          ClangDomain.value_or(constraintDomain(Pending.result));
+      Slot = Slot ? intersectDomains(std::move(*Slot), std::move(Incoming))
+                  : std::move(Incoming);
+      if (Slot->empty ||
+          (Pending.subject.error && !domainHasPositiveSolution(*Slot)))
+        return nullptr;
+      const ConstraintDomains *Stored =
+          ActiveCollector->makeConstraintDomains(std::move(Updated));
       State = State->set<ConstraintsByCall>(Pending.subject.call, Stored);
     }
     return State;
@@ -1057,9 +1151,10 @@ class SyscallScenarioChecker
       if (!Base)
         return true;
     }
+    ConstraintMap ClangConstraints = getConstraintMap(Base);
     bool Added = false;
     for (const ConstraintClause &Clause : *Extracted) {
-      if (ProgramStateRef Next = applyClause(Base, Clause)) {
+      if (ProgramStateRef Next = applyClause(Base, Clause, ClangConstraints)) {
         C.addTransition(Next);
         Added = true;
       }
@@ -1068,6 +1163,13 @@ class SyscallScenarioChecker
   }
 
 public:
+  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &Reaper) const {
+    for (const auto &Entry : State->get<SyscallBySymbol>())
+      Reaper.markLive(Entry.first);
+    for (const auto &Entry : State->get<ErrnoBySymbol>())
+      Reaper.markLive(Entry.first);
+  }
+
   void checkBind(SVal Location, SVal Value, const Stmt *Statement,
                  CheckerContext &C) const {
     const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());

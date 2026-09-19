@@ -439,8 +439,8 @@
     ],
     "result": {
       "ret": {
-        "op": "<",
-        "value": 0
+        "op": "<=",
+        "value": -1
       }
     },
     "syscall": "pidfd_getfd"
@@ -557,6 +557,34 @@
       "ret": {
         "op": "==",
         "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      615,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 5
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      616,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": ">=",
+        "value": 1
       }
     },
     "syscall": "pidfd_getfd"
