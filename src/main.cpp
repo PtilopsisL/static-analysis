@@ -155,26 +155,15 @@ static void normalizeDomain(IntegerDomain &Domain) {
   Domain.ranges = std::move(Merged);
 }
 
-static IntegerDomain constraintDomain(const ResultConstraint &Constraint) {
+static IntegerDomain negateDomain(IntegerDomain Domain) {
   constexpr int64_t Min = std::numeric_limits<int64_t>::min();
   constexpr int64_t Max = std::numeric_limits<int64_t>::max();
-  IntegerDomain Domain;
-  if (Constraint.op == "==") {
-    Domain.ranges.push_back({Constraint.value, Constraint.value});
-  } else if (Constraint.op == "!=") {
-    if (Constraint.value != Min)
-      Domain.ranges.push_back({Min, Constraint.value - 1});
-    if (Constraint.value != Max)
-      Domain.ranges.push_back({Constraint.value + 1, Max});
-  } else if (Constraint.op == ">" && Constraint.value != Max) {
-    Domain.ranges.push_back({Constraint.value + 1, Max});
-  } else if (Constraint.op == ">=") {
-    Domain.ranges.push_back({Constraint.value, Max});
-  } else if (Constraint.op == "<" && Constraint.value != Min) {
-    Domain.ranges.push_back({Min, Constraint.value - 1});
-  } else if (Constraint.op == "<=") {
-    Domain.ranges.push_back({Min, Constraint.value});
+  for (IntegerRange &Range : Domain.ranges) {
+    int64_t Lower = Range.upper == Max ? Min : -Range.upper;
+    int64_t Upper = Range.lower == Min ? Max : -Range.lower;
+    Range = {Lower, Upper};
   }
+  normalizeDomain(Domain);
   return Domain;
 }
 
@@ -323,34 +312,42 @@ struct Invocation {
   std::string syscall;
   std::vector<ConcreteValue> args;
   const Expr *eventSite = nullptr;
+  SymbolRef resultSymbol = nullptr;
+  SymbolRef errnoSymbol = nullptr;
   bool concrete = false;
 };
 
-struct AssertionObservation {
-  const Expr *assertionSite;
-  const Invocation *call;
-  ConstraintDomains domains;
+struct SymbolOwner {
+  const Invocation *call = nullptr;
+  bool error = false;
+
+  bool operator==(const SymbolOwner &Other) const {
+    return call == Other.call && error == Other.error;
+  }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const {
+    ID.AddPointer(call);
+    ID.AddBoolean(error);
+  }
 };
 
 struct Subject {
   const Invocation *call = nullptr;
   bool error = false;
-  int sign = 1;
   SymbolRef symbol = nullptr;
+  SymbolRef constrainedSymbol = nullptr;
+  bool negated = false;
 };
 
-struct PendingConstraint {
-  Subject subject;
-  ResultConstraint result;
+struct Provenance {
+  std::vector<Subject> subjects;
 };
 
-using ConstraintClause = std::vector<PendingConstraint>;
-using Predicate = std::vector<ConstraintClause>;
-
-struct PredicateBinding {
-  SVal value;
-  std::optional<Predicate> whenTrue;
-  std::optional<Predicate> whenFalse;
+struct AssertionMarker {
+  const Expr *site = nullptr;
+  const Invocation *call = nullptr;
+  std::vector<Subject> subjects;
+  bool explicitAssertion = false;
 };
 
 class Collector {
@@ -368,15 +365,15 @@ class Collector {
     const Invocation *call;
     std::string baseKey;
     std::vector<ConstraintDomains> alternatives;
+    bool explicitAssertion = false;
+    bool failureSeen = false;
   };
 
   std::set<std::string> SelectedFunctions;
   std::set<std::string> SelectedSyscalls;
   std::vector<std::unique_ptr<Invocation>> Invocations;
-  std::vector<std::unique_ptr<ConstraintDomains>> ConstraintDomainStorage;
-  std::vector<std::unique_ptr<AssertionObservation>> AssertionObservations;
-  std::vector<std::unique_ptr<PendingConstraint>> PendingConstraints;
-  std::vector<std::unique_ptr<PredicateBinding>> PredicateBindings;
+  std::vector<std::unique_ptr<Provenance>> Provenances;
+  std::vector<std::unique_ptr<AssertionMarker>> AssertionMarkers;
   std::set<std::string> SeenFunctions;
   std::vector<ObservationGroup> ObservationGroups;
   std::vector<EmittedRecord> Records;
@@ -556,56 +553,57 @@ public:
     return Invocations.back().get();
   }
 
-  const ConstraintDomains *makeConstraintDomains(ConstraintDomains Value) {
-    ConstraintDomainStorage.push_back(
-        std::make_unique<ConstraintDomains>(std::move(Value)));
-    return ConstraintDomainStorage.back().get();
+  const Provenance *makeProvenance(Provenance Value) {
+    Provenances.push_back(std::make_unique<Provenance>(std::move(Value)));
+    return Provenances.back().get();
   }
 
-  const AssertionObservation *
-  makeAssertionObservation(AssertionObservation Value) {
-    AssertionObservations.push_back(
-        std::make_unique<AssertionObservation>(std::move(Value)));
-    return AssertionObservations.back().get();
+  const AssertionMarker *makeAssertionMarker(AssertionMarker Value) {
+    AssertionMarkers.push_back(
+        std::make_unique<AssertionMarker>(std::move(Value)));
+    return AssertionMarkers.back().get();
   }
 
-  const PendingConstraint *makePendingConstraint(PendingConstraint Value) {
-    PendingConstraints.push_back(
-        std::make_unique<PendingConstraint>(std::move(Value)));
-    return PendingConstraints.back().get();
-  }
-
-  const PredicateBinding *makePredicateBinding(PredicateBinding Value) {
-    PredicateBindings.push_back(
-        std::make_unique<PredicateBinding>(std::move(Value)));
-    return PredicateBindings.back().get();
-  }
-
-  void observe(const Expr *AssertionSite, const Invocation *Call,
-               ConstraintDomains Domains) {
+  ObservationGroup *groupFor(const AssertionMarker *Marker) {
+    const Invocation *Call = Marker ? Marker->call : nullptr;
     if (!Call || !Call->concrete || !wantsFunction(Call->function) ||
         !wantsSyscall(Call->syscall))
-      return;
+      return nullptr;
     Finalized = false;
-    canonicalize(Domains);
     std::string Key = baseKey(*Call);
     auto Group =
         std::find_if(ObservationGroups.begin(), ObservationGroups.end(),
                      [&](const ObservationGroup &Candidate) {
-                       return Candidate.assertionSite == AssertionSite &&
+                       return Candidate.assertionSite == Marker->site &&
                               Candidate.eventSite == Call->eventSite &&
                               Candidate.call->function == Call->function &&
                               Candidate.baseKey == Key;
                      });
     if (Group == ObservationGroups.end()) {
-      ObservationGroups.push_back({AssertionSite,
+      ObservationGroups.push_back({Marker->site,
                                    Call->eventSite,
                                    Call,
                                    std::move(Key),
-                                   {std::move(Domains)}});
-      return;
+                                   {},
+                                   Marker->explicitAssertion,
+                                   false});
+      return &ObservationGroups.back();
     }
+    Group->explicitAssertion |= Marker->explicitAssertion;
+    return &*Group;
+  }
+
+  void observe(const AssertionMarker *Marker, ConstraintDomains Domains) {
+    ObservationGroup *Group = groupFor(Marker);
+    if (!Group)
+      return;
+    canonicalize(Domains);
     Group->alternatives.push_back(std::move(Domains));
+  }
+
+  void markFailure(const AssertionMarker *Marker) {
+    if (ObservationGroup *Group = groupFor(Marker))
+      Group->failureSeen = true;
   }
 
   void finalize() {
@@ -613,6 +611,9 @@ public:
       return;
     Records.clear();
     for (ObservationGroup &Group : ObservationGroups) {
+      if ((!Group.explicitAssertion && !Group.failureSeen) ||
+          Group.alternatives.empty())
+        continue;
       std::vector<ConstraintDomains> Alternatives = Group.alternatives;
       mergeAlternatives(Alternatives);
       for (const ConstraintDomains &Domains : Alternatives)
@@ -651,17 +652,15 @@ public:
 };
 
 static Collector *ActiveCollector = nullptr;
+static int ErrnoSymbolTag;
 
-REGISTER_MAP_WITH_PROGRAMSTATE(SyscallBySymbol, SymbolRef, const Invocation *)
-REGISTER_MAP_WITH_PROGRAMSTATE(ErrnoBySymbol, SymbolRef, const Invocation *)
-REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintsByCall, const Invocation *,
-                               const ConstraintDomains *)
-REGISTER_SET_WITH_PROGRAMSTATE(PendingObservations,
-                               const AssertionObservation *)
-REGISTER_MAP_WITH_PROGRAMSTATE(ConstraintByComparison, const BinaryOperator *,
-                               const PendingConstraint *)
-REGISTER_MAP_WITH_PROGRAMSTATE(PredicateByRegion, const MemRegion *,
-                               const PredicateBinding *)
+REGISTER_MAP_WITH_PROGRAMSTATE(SymbolOwners, SymbolRef, SymbolOwner)
+REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByComparison, const BinaryOperator *,
+                               const Provenance *)
+REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByRegion, const MemRegion *,
+                               const Provenance *)
+REGISTER_SET_WITH_PROGRAMSTATE(PendingAssertions, const AssertionMarker *)
+REGISTER_SET_WITH_PROGRAMSTATE(ActiveGuards, const AssertionMarker *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentErrnoOwner, const Invocation *)
 
 static const FunctionDecl *topFunction(const LocationContext *LC) {
@@ -792,42 +791,39 @@ static bool valuePreservingIntegerConversion(QualType From, QualType To,
   return SameSignedness && Context.getIntWidth(To) >= Context.getIntWidth(From);
 }
 
-static bool valuePreservingCast(const SymbolCast *Cast, ASTContext &Context) {
-  return valuePreservingIntegerConversion(Cast->getOperand()->getType(),
-                                          Cast->getType(), Context);
-}
-
-static int signOf(const SymExpr *Expression, SymbolRef Atom,
-                  ASTContext &Context) {
+static std::optional<bool> relationToAtom(SymbolRef Expression, SymbolRef Atom,
+                                          ASTContext &Context) {
   if (Expression == Atom)
-    return 1;
+    return false;
   if (const auto *Cast = dyn_cast<SymbolCast>(Expression)) {
-    if (!valuePreservingCast(Cast, Context))
-      return 0;
-    return signOf(Cast->getOperand(), Atom, Context);
+    if (!valuePreservingIntegerConversion(Cast->getOperand()->getType(),
+                                          Cast->getType(), Context))
+      return std::nullopt;
+    return relationToAtom(Cast->getOperand(), Atom, Context);
   }
-  if (const auto *Unary = dyn_cast<UnarySymExpr>(Expression)) {
-    int Sign = signOf(Unary->getOperand(), Atom, Context);
-    return Unary->getOpcode() == UO_Minus ? -Sign : 0;
-  }
-  return 0;
+  const auto *Unary = dyn_cast<UnarySymExpr>(Expression);
+  if (!Unary || Unary->getOpcode() != UO_Minus)
+    return std::nullopt;
+  QualType OperandType = Unary->getOperand()->getType();
+  QualType ResultType = Unary->getType();
+  if (!OperandType->isSignedIntegerType() ||
+      !ResultType->isSignedIntegerType() ||
+      Context.getIntWidth(OperandType) != Context.getIntWidth(ResultType))
+    return std::nullopt;
+  auto Inner = relationToAtom(Unary->getOperand(), Atom, Context);
+  return Inner ? std::optional<bool>(!*Inner) : std::nullopt;
 }
 
 static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
                                           QualType ObservedType,
                                           ASTContext &Context) {
-  const SymExpr *Expression = Value.getAsSymbol(true);
-  if (!Expression)
+  SymbolRef ConstrainedSymbol = Value.getAsSymbol(true);
+  if (!ConstrainedSymbol)
     return std::nullopt;
   std::optional<Subject> Found;
   for (SymbolRef Atom : Value.symbols()) {
-    const Invocation *const *Call = State->get<SyscallBySymbol>(Atom);
-    bool Error = false;
-    if (!Call) {
-      Call = State->get<ErrnoBySymbol>(Atom);
-      Error = true;
-    }
-    if (!Call)
+    const SymbolOwner *Owner = State->get<SymbolOwners>(Atom);
+    if (!Owner)
       continue;
     // The analyzer may represent a same-width signedness cast with the
     // original symbol. Check the AST operand type as well as SymbolCast nodes
@@ -835,78 +831,16 @@ static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
     if (!valuePreservingIntegerConversion(Atom->getType(), ObservedType,
                                           Context))
       return std::nullopt;
-    int Sign = signOf(Expression, Atom, Context);
-    if (!Sign || (Found && (Found->call != *Call || Found->symbol != Atom)))
+    auto Negated = relationToAtom(ConstrainedSymbol, Atom, Context);
+    if (!Negated)
       return std::nullopt;
-    Found = Subject{*Call, Error, Sign, Atom};
+    if (Found && (Found->call != Owner->call || Found->symbol != Atom ||
+                  Found->error != Owner->error))
+      return std::nullopt;
+    Found =
+        Subject{Owner->call, Owner->error, Atom, ConstrainedSymbol, *Negated};
   }
   return Found;
-}
-
-static std::string reversedComparison(BinaryOperatorKind Op) {
-  switch (Op) {
-  case BO_EQ:
-    return "==";
-  case BO_NE:
-    return "!=";
-  case BO_LT:
-    return ">";
-  case BO_LE:
-    return ">=";
-  case BO_GT:
-    return "<";
-  case BO_GE:
-    return "<=";
-  default:
-    return {};
-  }
-}
-
-static std::string directComparison(BinaryOperatorKind Op) {
-  switch (Op) {
-  case BO_EQ:
-    return "==";
-  case BO_NE:
-    return "!=";
-  case BO_LT:
-    return "<";
-  case BO_LE:
-    return "<=";
-  case BO_GT:
-    return ">";
-  case BO_GE:
-    return ">=";
-  default:
-    return {};
-  }
-}
-
-static std::string negateComparison(std::string Op) {
-  if (Op == "<")
-    return ">";
-  if (Op == "<=")
-    return ">=";
-  if (Op == ">")
-    return "<";
-  if (Op == ">=")
-    return "<=";
-  return Op;
-}
-
-static std::string negateTruth(std::string Op) {
-  if (Op == "==")
-    return "!=";
-  if (Op == "!=")
-    return "==";
-  if (Op == "<")
-    return ">=";
-  if (Op == "<=")
-    return ">";
-  if (Op == ">")
-    return "<=";
-  if (Op == ">=")
-    return "<";
-  return {};
 }
 
 static SVal currentValue(const Expr *Expression, CheckerContext &C) {
@@ -919,156 +853,75 @@ static SVal currentValue(const Expr *Expression, CheckerContext &C) {
   return C.getState()->getSVal(Location, Variable->getType());
 }
 
-static std::optional<llvm::APSInt>
-concreteInteger(const Expr *Expression, SVal Value, CheckerContext &C) {
-  if (const llvm::APSInt *Integer = Value.getAsInteger())
-    return *Integer;
-  Expr::EvalResult Result;
-  if (Expression->EvaluateAsInt(Result, C.getASTContext()))
-    return Result.Val.getInt();
-  return std::nullopt;
+static void appendSubject(std::vector<Subject> &Subjects, Subject Value) {
+  auto Same = [&](const Subject &Existing) {
+    return Existing.call == Value.call && Existing.error == Value.error &&
+           Existing.symbol == Value.symbol &&
+           Existing.constrainedSymbol == Value.constrainedSymbol &&
+           Existing.negated == Value.negated;
+  };
+  if (std::none_of(Subjects.begin(), Subjects.end(), Same))
+    Subjects.push_back(Value);
 }
 
-static std::optional<PendingConstraint>
-extractComparison(const BinaryOperator *Compare, CheckerContext &C) {
-  if (!Compare || !Compare->isComparisonOp())
-    return std::nullopt;
-  SVal LHS = currentValue(Compare->getLHS(), C);
-  SVal RHS = currentValue(Compare->getRHS(), C);
-  auto LeftSubject = findSubject(
-      LHS, C.getState(), Compare->getLHS()->getType(), C.getASTContext());
-  auto RightSubject = findSubject(
-      RHS, C.getState(), Compare->getRHS()->getType(), C.getASTContext());
-  auto LeftInteger = concreteInteger(Compare->getLHS(), LHS, C);
-  auto RightInteger = concreteInteger(Compare->getRHS(), RHS, C);
-  Subject S;
-  std::optional<llvm::APSInt> Integer;
-  std::string Op;
-  if (LeftSubject && RightInteger) {
-    S = *LeftSubject;
-    Integer = RightInteger;
-    Op = directComparison(Compare->getOpcode());
-  } else if (RightSubject && LeftInteger) {
-    S = *RightSubject;
-    Integer = LeftInteger;
-    Op = reversedComparison(Compare->getOpcode());
-  } else {
-    return std::nullopt;
-  }
-  if (!Integer || Integer->getBitWidth() > 64 || Op.empty())
-    return std::nullopt;
-  if (Integer->isUnsigned() &&
-      Integer->getZExtValue() >
-          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-    return std::nullopt;
-  int64_t Value = Integer->isUnsigned()
-                      ? static_cast<int64_t>(Integer->getZExtValue())
-                      : Integer->getSExtValue();
-  if (S.sign < 0) {
-    if (Value == INT64_MIN)
-      return std::nullopt;
-    Value = -Value;
-    Op = negateComparison(std::move(Op));
-  }
-  return PendingConstraint{S, ResultConstraint{std::move(Op), Value}};
+static void collectDirectSubject(const Expr *Expression, CheckerContext &C,
+                                 std::vector<Subject> &Subjects) {
+  if (!Expression)
+    return;
+  if (auto Found = findSubject(currentValue(Expression, C), C.getState(),
+                               Expression->getType(), C.getASTContext()))
+    appendSubject(Subjects, *Found);
 }
 
-static std::optional<Predicate> andPredicate(const Predicate &LHS,
-                                             const Predicate &RHS) {
-  Predicate Result;
-  if (LHS.empty() || RHS.empty())
-    return Result;
-  for (const ConstraintClause &Left : LHS) {
-    for (const ConstraintClause &Right : RHS) {
-      if (Result.size() >= 16)
-        return std::nullopt;
-      ConstraintClause Combined = Left;
-      Combined.insert(Combined.end(), Right.begin(), Right.end());
-      Result.push_back(std::move(Combined));
-    }
-  }
-  return Result;
-}
-
-static std::optional<Predicate> orPredicate(const Predicate &LHS,
-                                            const Predicate &RHS) {
-  if (LHS.size() + RHS.size() > 16)
-    return std::nullopt;
-  Predicate Result = LHS;
-  Result.insert(Result.end(), RHS.begin(), RHS.end());
-  return Result;
-}
-
-static bool containsConstraint(const std::optional<Predicate> &Value) {
-  if (!Value)
-    return false;
-  return std::any_of(
-      Value->begin(), Value->end(),
-      [](const ConstraintClause &Clause) { return !Clause.empty(); });
-}
-
-static std::optional<Predicate> extractPredicate(const Expr *Expression,
-                                                 bool Expected,
-                                                 CheckerContext &C,
-                                                 unsigned Depth = 0) {
-  if (!Expression || Depth > 24)
-    return std::nullopt;
+static void collectProvenance(const Expr *Expression, CheckerContext &C,
+                              std::vector<Subject> &Subjects,
+                              unsigned Depth = 0) {
+  if (!Expression || Depth > 32)
+    return;
+  const Expr *ValueExpression = Expression;
   Expression = ignoreExpr(Expression);
-
-  if (const auto *Not = dyn_cast<UnaryOperator>(Expression)) {
-    if (Not->getOpcode() == UO_LNot)
-      return extractPredicate(Not->getSubExpr(), !Expected, C, Depth + 1);
-  }
-
-  if (const auto *Logical = dyn_cast<BinaryOperator>(Expression)) {
-    if (Logical->getOpcode() == BO_LAnd || Logical->getOpcode() == BO_LOr) {
-      auto Left = extractPredicate(Logical->getLHS(), Expected, C, Depth + 1);
-      auto Right = extractPredicate(Logical->getRHS(), Expected, C, Depth + 1);
-      if (!Left || !Right)
-        return std::nullopt;
-      bool NeedAnd = (Logical->getOpcode() == BO_LAnd) == Expected;
-      return NeedAnd ? andPredicate(*Left, *Right) : orPredicate(*Left, *Right);
-    }
-
-    if (Logical->isComparisonOp()) {
-      std::optional<PendingConstraint> Pending;
-      if (const PendingConstraint *const *Cached =
-              C.getState()->get<ConstraintByComparison>(Logical))
-        Pending = **Cached;
-      else
-        Pending = extractComparison(Logical, C);
-      if (!Pending)
-        return std::nullopt;
-      if (!Expected)
-        Pending->result.op = negateTruth(std::move(Pending->result.op));
-      if (Pending->subject.error &&
-          !domainHasPositiveSolution(constraintDomain(Pending->result)))
-        return std::nullopt;
-      return Predicate{{std::move(*Pending)}};
-    }
-  }
+  if (!Expression)
+    return;
 
   if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
+    collectDirectSubject(Expression, C, Subjects);
     const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
-    if (Variable) {
-      Loc Location = C.getState()->getLValue(Variable, C.getLocationContext());
-      const MemRegion *Region = Location.getAsRegion();
-      const PredicateBinding *const *Stored =
-          Region ? C.getState()->get<PredicateByRegion>(Region) : nullptr;
-      if (Stored && currentValue(Expression, C) == (*Stored)->value) {
-        const std::optional<Predicate> &Result =
-            Expected ? (*Stored)->whenTrue : (*Stored)->whenFalse;
-        return Result;
+    if (!Variable)
+      return;
+    Loc Location = C.getState()->getLValue(Variable, C.getLocationContext());
+    const MemRegion *Region = Location.getAsRegion();
+    const Provenance *const *Stored =
+        Region ? C.getState()->get<ProvenanceByRegion>(Region) : nullptr;
+    if (Stored)
+      for (const Subject &Subject : (*Stored)->subjects)
+        appendSubject(Subjects, Subject);
+    return;
+  }
+
+  if (const auto *Binary = dyn_cast<BinaryOperator>(Expression)) {
+    if (Binary->isComparisonOp()) {
+      const Provenance *const *Stored =
+          C.getState()->get<ProvenanceByComparison>(Binary);
+      if (Stored) {
+        for (const Subject &Subject : (*Stored)->subjects)
+          appendSubject(Subjects, Subject);
       }
+      return;
+    }
+    if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
+      collectProvenance(Binary->getLHS(), C, Subjects, Depth + 1);
+      collectProvenance(Binary->getRHS(), C, Subjects, Depth + 1);
+      return;
     }
   }
 
-  SVal Current = currentValue(Expression, C);
-  if (const llvm::APSInt *Integer = Current.getAsInteger()) {
-    bool Actual = Integer->getBoolValue();
-    return Actual == Expected ? Predicate{ConstraintClause{}} : Predicate{};
+  if (const auto *Unary = dyn_cast<UnaryOperator>(Expression)) {
+    if (Unary->getOpcode() == UO_LNot) {
+      collectProvenance(Unary->getSubExpr(), C, Subjects, Depth + 1);
+      return;
+    }
   }
-  return std::nullopt;
+  collectDirectSubject(ValueExpression, C, Subjects);
 }
 
 static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
@@ -1076,6 +929,9 @@ static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
   for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
     llvm::StringRef Name =
         Lexer::getImmediateMacroName(Location, SM, C.getLangOpts());
+    if (Name == "EXPECT_SYSEQ" || Name == "EXPECT_SYSZR" ||
+        Name == "EXPECT_SYSER")
+      return false;
     if (Name == "CHECK_OP" || Name.starts_with("EXPECT_") ||
         Name.starts_with("ASSERT_"))
       return true;
@@ -1110,14 +966,6 @@ static bool knownFailureReturn(const ReturnStmt *Return, CheckerContext &C) {
          failureMacroAt(Return->getRetValue()->getExprLoc(), C);
 }
 
-static bool knownFailureEvent(const Stmt *Statement, CheckerContext &C) {
-  if (const auto *Return = dyn_cast<ReturnStmt>(Statement))
-    return knownFailureReturn(Return, C);
-  if (const auto *Expression = dyn_cast<Expr>(Statement))
-    return knownFailureCall(dyn_cast_or_null<CallExpr>(ignoreExpr(Expression)));
-  return false;
-}
-
 static bool preservesSyscallContext(const CallEvent &Call) {
   const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
   if (!ND)
@@ -1139,88 +987,11 @@ static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
 }
 
 class SyscallScenarioChecker
-    : public Checker<
-          eval::Call, check::PreCall, check::Bind, check::LiveSymbols,
-          check::PreStmt<ReturnStmt>, check::PostStmt<UnaryOperator>,
-          check::PostStmt<ImplicitCastExpr>, check::PostStmt<BinaryOperator>,
-          check::BeginFunction, check::EndFunction, check::BranchCondition> {
-  using CFGKey = std::pair<const Decl *, const CFG *>;
-  mutable std::map<CFGKey, std::set<const CFGBlock *>> FailureBlocks;
-
-  const std::set<const CFGBlock *> &failureBlocks(const CFG &Graph,
-                                                  CheckerContext &C) const {
-    CFGKey Key{C.getCurrentAnalysisDeclContext()->getDecl(), &Graph};
-    auto [It, Inserted] = FailureBlocks.try_emplace(Key);
-    if (!Inserted)
-      return It->second;
-
-    std::set<const CFGBlock *> &Result = It->second;
-    for (const CFGBlock *Block : Graph) {
-      for (const CFGElement &Element : *Block) {
-        auto Statement = Element.getAs<CFGStmt>();
-        if (Statement && knownFailureEvent(Statement->getStmt(), C)) {
-          Result.insert(Block);
-          break;
-        }
-      }
-    }
-
-    // Least fixed point: a block is definitely failing when it contains a
-    // failure event, or every reachable successor is already definitely
-    // failing. Cycles without a failure remain outside the set.
-    bool Changed;
-    do {
-      Changed = false;
-      for (const CFGBlock *Block : Graph) {
-        if (Result.count(Block) || Block == &Graph.getExit())
-          continue;
-        bool HasSuccessor = false;
-        bool AllFail = true;
-        for (const CFGBlock::AdjacentBlock &Adjacent : Block->succs()) {
-          const CFGBlock *Successor = Adjacent.getReachableBlock();
-          if (!Successor)
-            continue;
-          HasSuccessor = true;
-          AllFail &= Result.count(Successor) != 0;
-        }
-        if (HasSuccessor && AllFail) {
-          Result.insert(Block);
-          Changed = true;
-        }
-      }
-    } while (Changed);
-    return Result;
-  }
-
-  std::optional<bool> successfulCondition(const Stmt *Condition,
-                                          CheckerContext &C) const {
-    const auto *Expression = dyn_cast_or_null<Expr>(Condition);
-    const CFGBlock *Block = C.getCFGElementRef().getParent();
-    if (!Expression || !Block)
-      return std::nullopt;
-
-    if (const auto *If = dyn_cast_or_null<IfStmt>(Block->getTerminatorStmt())) {
-      if (ignoreExpr(Expression) == ignoreExpr(If->getCond()) &&
-          (assertionMacroAt(If->getIfLoc(), C) ||
-           assertionMacroAt(Expression->getExprLoc(), C)))
-        return false;
-    }
-
-    if (Block->succ_size() != 2)
-      return std::nullopt;
-    const CFG &Graph = *Block->getParent();
-    const std::set<const CFGBlock *> &Failures = failureBlocks(Graph, C);
-    auto Successor = Block->succ_begin();
-    const CFGBlock *WhenTrue = Successor->getReachableBlock();
-    ++Successor;
-    const CFGBlock *WhenFalse = Successor->getReachableBlock();
-    bool TrueFails = WhenTrue && Failures.count(WhenTrue);
-    bool FalseFails = WhenFalse && Failures.count(WhenFalse);
-    if (TrueFails == FalseFails)
-      return std::nullopt;
-    return !TrueFails;
-  }
-
+    : public Checker<eval::Call, check::PreCall, check::Bind,
+                     check::LiveSymbols, check::PreStmt<ReturnStmt>,
+                     check::PostStmt<ImplicitCastExpr>,
+                     check::PostStmt<BinaryOperator>, check::BeginFunction,
+                     check::EndFunction, check::BranchCondition> {
   static const Expr *bindingSource(const VarDecl *Variable,
                                    const Stmt *Statement) {
     if (const auto *Declaration = dyn_cast_or_null<DeclStmt>(Statement)) {
@@ -1237,103 +1008,151 @@ class SyscallScenarioChecker
     return nullptr;
   }
 
-  static void collectEvaluatedConstraints(
-      const Expr *Expression, ProgramStateRef State,
-      std::map<SymbolRef, const PendingConstraint *> &Subjects) {
-    Expression = ignoreExpr(Expression);
-    if (!Expression)
-      return;
-    if (const auto *Binary = dyn_cast<BinaryOperator>(Expression)) {
-      if (Binary->isComparisonOp()) {
-        if (const PendingConstraint *const *Pending =
-                State->get<ConstraintByComparison>(Binary))
-          if ((*Pending)->subject.symbol &&
-              (!(*Pending)->subject.error ||
-               domainHasPositiveSolution(constraintDomain((*Pending)->result))))
-            Subjects.try_emplace((*Pending)->subject.symbol, *Pending);
-        return;
-      }
-      if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
-        collectEvaluatedConstraints(Binary->getLHS(), State, Subjects);
-        collectEvaluatedConstraints(Binary->getRHS(), State, Subjects);
-      }
-      return;
+  static ProgramStateRef addMarkers(ProgramStateRef State, const Expr *Site,
+                                    const std::vector<Subject> &Subjects,
+                                    bool ExplicitAssertion) {
+    std::map<const Invocation *, std::vector<Subject>> ByCall;
+    for (const Subject &Subject : Subjects)
+      ByCall[Subject.call].push_back(Subject);
+    for (auto &[Call, CallSubjects] : ByCall) {
+      const AssertionMarker *Marker = ActiveCollector->makeAssertionMarker(
+          {Site, Call, std::move(CallSubjects), ExplicitAssertion});
+      State = ExplicitAssertion ? State->add<PendingAssertions>(Marker)
+                                : State->add<ActiveGuards>(Marker);
     }
-    if (const auto *Unary = dyn_cast<UnaryOperator>(Expression))
-      if (Unary->getOpcode() == UO_LNot)
-        collectEvaluatedConstraints(Unary->getSubExpr(), State, Subjects);
+    return State;
   }
 
-  static bool applyPredicate(const Expr *Expression, bool Expected,
+  static void applyAssertion(const Expr *Expression, bool Expected,
                              CheckerContext &C) {
-    auto Extracted = extractPredicate(Expression, Expected, C);
-    std::map<SymbolRef, const PendingConstraint *> Subjects;
-    if (Extracted)
-      for (const ConstraintClause &Clause : *Extracted)
-        for (const PendingConstraint &Pending : Clause)
-          if (Pending.subject.symbol)
-            Subjects.try_emplace(Pending.subject.symbol, &Pending);
-    collectEvaluatedConstraints(Expression, C.getState(), Subjects);
+    std::vector<Subject> Subjects;
+    collectProvenance(Expression, C, Subjects);
     if (Subjects.empty())
-      return false;
-
+      return;
     ProgramStateRef Base = C.getState();
     if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
       Base = Base->assume(*Value, Expected);
-      if (!Base)
-        return true;
-    }
-    ConstraintMap ClangConstraints = getConstraintMap(Base);
-    bool AllowFallback = Extracted && Extracted->size() == 1;
-    bool Added = false;
-    std::set<const Invocation *> TouchedCalls;
-    for (const auto &[Symbol, PendingPointer] : Subjects) {
-      const PendingConstraint &Pending = *PendingPointer;
-      std::optional<IntegerDomain> Domain;
-      if (const RangeSet *Ranges = ClangConstraints.lookup(Symbol))
-        Domain = domainForRangeSet(*Ranges);
-      if (!Domain)
-        Domain =
-            AllowFallback ? constraintDomain(Pending.result) : fullDomain();
-
-      ConstraintDomains Updated;
-      if (const ConstraintDomains *const *Old =
-              Base->get<ConstraintsByCall>(Pending.subject.call))
-        Updated = **Old;
-      std::optional<IntegerDomain> &Slot =
-          Pending.subject.error ? Updated.error : Updated.ret;
-      Slot = Slot ? intersectDomains(std::move(*Slot), *Domain)
-                  : std::move(*Domain);
-      if (Slot->empty() ||
-          (Pending.subject.error && !domainHasPositiveSolution(*Slot)))
-        continue;
-      const ConstraintDomains *Stored =
-          ActiveCollector->makeConstraintDomains(std::move(Updated));
-      Base = Base->set<ConstraintsByCall>(Pending.subject.call, Stored);
-      TouchedCalls.insert(Pending.subject.call);
-      Added = true;
-    }
-    if (Added) {
-      for (const Invocation *Call : TouchedCalls) {
-        const ConstraintDomains *const *Domains =
-            Base->get<ConstraintsByCall>(Call);
-        if (!Domains)
-          continue;
-        const AssertionObservation *Observation =
-            ActiveCollector->makeAssertionObservation(
-                {Expression, Call, **Domains});
-        Base = Base->add<PendingObservations>(Observation);
+      if (!Base) {
+        C.addSink();
+        return;
       }
-      C.addTransition(Base);
     }
-    return Added;
+    Base = addMarkers(Base, Expression, Subjects, true);
+    C.addTransition(Base);
+  }
+
+  static ProgramStateRef assumeEqual(ProgramStateRef State, SVal LHS, SVal RHS,
+                                     CheckerContext &C) {
+    auto Left = LHS.getAs<DefinedOrUnknownSVal>();
+    auto Right = RHS.getAs<DefinedOrUnknownSVal>();
+    if (!Left || !Right)
+      return State;
+    DefinedOrUnknownSVal Equal =
+        C.getSValBuilder().evalEQ(State, *Left, *Right);
+    return State->assume(Equal, true);
+  }
+
+  static bool applyAssertionCall(const CallEvent &Call, CheckerContext &C) {
+    bool SysEq = namedCall(Call, "expect_syseq") && Call.getNumArgs() >= 2;
+    bool SysZero = namedCall(Call, "expect_syszr") && Call.getNumArgs() >= 1;
+    bool SysError = namedCall(Call, "expect_syserr") && Call.getNumArgs() >= 3;
+    if (!SysEq && !SysZero && !SysError)
+      return false;
+
+    std::vector<Subject> Subjects;
+    if (const Expr *Argument = Call.getArgExpr(0))
+      collectProvenance(Argument, C, Subjects);
+    if (Subjects.empty())
+      return true;
+    ProgramStateRef State = C.getState();
+    SVal Expected =
+        SysZero
+            ? C.getSValBuilder().makeIntVal(0, Call.getArgExpr(0)->getType())
+            : Call.getArgSVal(1);
+    State = assumeEqual(State, Call.getArgSVal(0), Expected, C);
+    if (!State) {
+      C.addSink();
+      return true;
+    }
+
+    if (SysError) {
+      std::vector<const Invocation *> Calls;
+      for (const Subject &Subject : Subjects)
+        if (!Subject.error &&
+            std::find(Calls.begin(), Calls.end(), Subject.call) == Calls.end())
+          Calls.push_back(Subject.call);
+      for (const Invocation *Invocation : Calls) {
+        if (!Invocation->errnoSymbol)
+          continue;
+        State = assumeEqual(State, nonloc::SymbolVal(Invocation->errnoSymbol),
+                            Call.getArgSVal(2), C);
+        if (!State) {
+          C.addSink();
+          return true;
+        }
+        appendSubject(Subjects, {Invocation, true, Invocation->errnoSymbol,
+                                 Invocation->errnoSymbol, false});
+      }
+    }
+
+    const Expr *Site = Call.getOriginExpr();
+    State = addMarkers(State, Site, Subjects, true);
+    C.addTransition(State);
+    return true;
+  }
+
+  static void registerGuard(const Expr *Expression, CheckerContext &C) {
+    std::vector<Subject> Subjects;
+    collectProvenance(Expression, C, Subjects);
+    if (!Subjects.empty())
+      C.addTransition(addMarkers(C.getState(), Expression, Subjects, false));
+  }
+
+  static void markFailureGuards(ProgramStateRef State) {
+    if (!ActiveCollector)
+      return;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      ActiveCollector->markFailure(Marker);
+  }
+
+  static std::optional<ConstraintDomains>
+  domainsForMarker(const AssertionMarker *Marker, ProgramStateRef State) {
+    ConstraintDomains Domains;
+    ConstraintMap ClangConstraints = getConstraintMap(State);
+    for (const Subject &Subject : Marker->subjects) {
+      IntegerDomain Incoming = fullDomain();
+      if (const RangeSet *Ranges =
+              ClangConstraints.lookup(Subject.constrainedSymbol)) {
+        auto FromClang = domainForRangeSet(*Ranges);
+        if (!FromClang)
+          return std::nullopt;
+        Incoming = Subject.negated ? negateDomain(std::move(*FromClang))
+                                   : std::move(*FromClang);
+      }
+      if (Subject.constrainedSymbol != Subject.symbol) {
+        if (const RangeSet *Ranges = ClangConstraints.lookup(Subject.symbol)) {
+          auto FromClang = domainForRangeSet(*Ranges);
+          if (!FromClang)
+            return std::nullopt;
+          Incoming =
+              intersectDomains(std::move(Incoming), std::move(*FromClang));
+        }
+      }
+      std::optional<IntegerDomain> &Slot =
+          Subject.error ? Domains.error : Domains.ret;
+      Slot = Slot ? intersectDomains(std::move(*Slot), std::move(Incoming))
+                  : std::move(Incoming);
+      if (Slot->empty())
+        return std::nullopt;
+    }
+    if (Domains.error && !domainHasPositiveSolution(*Domains.error))
+      return std::nullopt;
+    return Domains;
   }
 
 public:
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &Reaper) const {
-    for (const auto &Entry : State->get<SyscallBySymbol>())
-      Reaper.markLive(Entry.first);
-    for (const auto &Entry : State->get<ErrnoBySymbol>())
+    for (const auto &Entry : State->get<SymbolOwners>())
       Reaper.markLive(Entry.first);
   }
 
@@ -1345,17 +1164,21 @@ public:
       return;
 
     ProgramStateRef State = C.getState();
-    if (State->get<PredicateByRegion>(Region))
-      State = State->remove<PredicateByRegion>(Region);
+    if (State->get<ProvenanceByRegion>(Region))
+      State = State->remove<ProvenanceByRegion>(Region);
 
-    const Expr *Source = bindingSource(Variable, Statement);
-    if (Source && ActiveCollector) {
-      std::optional<Predicate> WhenTrue = extractPredicate(Source, true, C);
-      std::optional<Predicate> WhenFalse = extractPredicate(Source, false, C);
-      if (containsConstraint(WhenTrue) || containsConstraint(WhenFalse)) {
-        const PredicateBinding *Binding = ActiveCollector->makePredicateBinding(
-            {Value, std::move(WhenTrue), std::move(WhenFalse)});
-        State = State->set<PredicateByRegion>(Region, Binding);
+    if (ActiveCollector) {
+      std::vector<Subject> Subjects;
+      if (auto Direct = findSubject(Value, C.getState(), Variable->getType(),
+                                    C.getASTContext()))
+        appendSubject(Subjects, *Direct);
+      const Expr *Source = bindingSource(Variable, Statement);
+      if (Source)
+        collectProvenance(Source, C, Subjects);
+      if (!Subjects.empty()) {
+        const Provenance *Binding =
+            ActiveCollector->makeProvenance({std::move(Subjects)});
+        State = State->set<ProvenanceByRegion>(Region, Binding);
       }
     }
     if (State != C.getState())
@@ -1365,6 +1188,7 @@ public:
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
     if (knownFailureCall(
             dyn_cast_or_null<CallExpr>(ignoreExpr(Call.getOriginExpr())))) {
+      markFailureGuards(C.getState());
       C.addSink();
       return true;
     }
@@ -1391,32 +1215,42 @@ public:
       }
       Value.args.push_back(std::move(*Arg));
     }
-    const Invocation *Stored =
-        ActiveCollector->makeInvocation(std::move(Value));
     SVal Return = C.getSValBuilder().conjureSymbolVal(
         Call, Call.getResultType(), C.blockCount(), this);
-    SymbolRef Symbol = Return.getAsSymbol();
-    if (!Symbol)
+    SVal Error = C.getSValBuilder().conjureSymbolVal(
+        Call, C.getASTContext().IntTy, C.blockCount(), &ErrnoSymbolTag);
+    Value.resultSymbol = Return.getAsSymbol();
+    Value.errnoSymbol = Error.getAsSymbol();
+    if (!Value.resultSymbol || !Value.errnoSymbol)
       return false;
+    const Invocation *Stored =
+        ActiveCollector->makeInvocation(std::move(Value));
     ProgramStateRef State = C.getState()->BindExpr(
         Call.getOriginExpr(), C.getLocationContext(), Return);
-    State = State->set<SyscallBySymbol>(Symbol, Stored);
+    State = State->set<SymbolOwners>(Stored->resultSymbol,
+                                     SymbolOwner{Stored, false});
+    State = State->set<SymbolOwners>(Stored->errnoSymbol,
+                                     SymbolOwner{Stored, true});
     State = State->set<CurrentErrnoOwner>(Stored);
     C.addTransition(State);
     return true;
   }
 
   void checkPreStmt(const ReturnStmt *Return, CheckerContext &C) const {
-    if (knownFailureReturn(Return, C))
+    if (knownFailureReturn(Return, C)) {
+      markFailureGuards(C.getState());
       C.addSink();
+    }
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
     if (namedCall(Call, "ksft_test_result") && Call.getNumArgs() > 0) {
       if (const Expr *Condition = Call.getArgExpr(0))
-        if (applyPredicate(Condition, true, C))
-          return;
+        applyAssertion(Condition, true, C);
+      return;
     }
+    if (applyAssertionCall(Call, C))
+      return;
     if (namedCall(Call, "syscall")) {
       if (modelableSyscall(Call, C))
         return;
@@ -1432,33 +1266,22 @@ public:
   }
 
   void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
-    auto Pending = extractComparison(Compare, C);
-    if (!Pending || !ActiveCollector)
-      return;
-    const PendingConstraint *Stored =
-        ActiveCollector->makePendingConstraint(std::move(*Pending));
-    C.addTransition(C.getState()->set<ConstraintByComparison>(Compare, Stored));
-  }
-
-  void checkPostStmt(const UnaryOperator *UO, CheckerContext &C) const {
-    if (UO->getOpcode() != UO_Deref)
-      return;
-    const Expr *Operand = ignoreExpr(UO->getSubExpr());
-    const auto *CE = dyn_cast_or_null<CallExpr>(Operand);
-    const FunctionDecl *FD = CE ? CE->getDirectCallee() : nullptr;
-    if (!FD || FD->getName() != "__errno_location")
-      return;
-    const Invocation *Owner = C.getState()->get<CurrentErrnoOwner>();
-    if (!Owner)
+    if (!Compare->isComparisonOp() || !ActiveCollector)
       return;
     ProgramStateRef State = C.getState();
-    bool Changed = false;
-    for (SymbolRef Atom : C.getSVal(UO).symbols()) {
-      State = State->set<ErrnoBySymbol>(Atom, Owner);
-      Changed = true;
+    if (State->get<ProvenanceByComparison>(Compare))
+      State = State->remove<ProvenanceByComparison>(Compare);
+    std::vector<Subject> Subjects;
+    collectProvenance(Compare->getLHS(), C, Subjects);
+    collectProvenance(Compare->getRHS(), C, Subjects);
+    if (Subjects.empty()) {
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
     }
-    if (Changed)
-      C.addTransition(State);
+    const Provenance *Stored =
+        ActiveCollector->makeProvenance({std::move(Subjects)});
+    C.addTransition(State->set<ProvenanceByComparison>(Compare, Stored));
   }
 
   void checkPostStmt(const ImplicitCastExpr *Cast, CheckerContext &C) const {
@@ -1476,7 +1299,7 @@ public:
     ProgramStateRef State = C.getState();
     bool Changed = false;
     for (SymbolRef Atom : C.getSVal(Cast).symbols()) {
-      State = State->set<ErrnoBySymbol>(Atom, Owner);
+      State = State->set<SymbolOwners>(Atom, SymbolOwner{Owner, true});
       Changed = true;
     }
     if (Changed)
@@ -1491,18 +1314,32 @@ public:
 
   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
     const auto *Expression = dyn_cast<Expr>(Condition);
-    std::optional<bool> Expected = successfulCondition(Condition, C);
-    if (Expression && Expected)
-      applyPredicate(Expression, *Expected, C);
+    const CFGBlock *Block = C.getCFGElementRef().getParent();
+    if (!Expression || !Block)
+      return;
+    if (const auto *If = dyn_cast_or_null<IfStmt>(Block->getTerminatorStmt())) {
+      if (ignoreExpr(Expression) == ignoreExpr(If->getCond()) &&
+          (assertionMacroAt(If->getIfLoc(), C) ||
+           assertionMacroAt(Expression->getExprLoc(), C))) {
+        applyAssertion(Expression, false, C);
+        return;
+      }
+    }
+    registerGuard(Expression, C);
   }
 
   void checkEndFunction(const ReturnStmt *, CheckerContext &C) const {
     if (!C.inTopFrame() || !ActiveCollector)
       return;
-    for (const AssertionObservation *Observation :
-         C.getState()->get<PendingObservations>())
-      ActiveCollector->observe(Observation->assertionSite, Observation->call,
-                               Observation->domains);
+    for (const AssertionMarker *Marker :
+         C.getState()->get<PendingAssertions>()) {
+      if (auto Domains = domainsForMarker(Marker, C.getState())) {
+        ActiveCollector->observe(Marker, std::move(*Domains));
+      }
+    }
+    for (const AssertionMarker *Marker : C.getState()->get<ActiveGuards>())
+      if (auto Domains = domainsForMarker(Marker, C.getState()))
+        ActiveCollector->observe(Marker, std::move(*Domains));
   }
 };
 

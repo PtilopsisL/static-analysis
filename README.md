@@ -118,18 +118,19 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 }
 ```
 
-结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。只有 syscall 参数和关联断言都能在同一路径上具体化时才输出；未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束都会被过滤。checker 保持 syscall/errno symbol 存活，并优先读取 Clang 在 assertion 成功路径上给出的 `RangeSet`；OracleRecognizer 主要负责从实际执行过的 comparison 找回 syscall event provenance，并在 Clang 没有可用范围时提供保守回退。每个 assertion 成功状态只产生一个 analyzer transition；到达函数终点后，同一 assertion 的成功路径按 event 聚合。聚合仅在另一字段的约束相同时对 ret 或 errno 做精确并集，因此 `A || true` 会自然并成无约束而不输出，ret/errno 的分支相关性也不会被错误交叉组合。路径状态保存规范化的整数约束域，只在输出边界将其投影成当前 schema 的单个比较式；例如 `ret >= 0 && ret >= 1` 可投影为 `ret >= 1`，而最终仍为 `0 <= ret && ret < 10` 的约束会保守过滤。中间暂时无法投影的约束域仍可被后续条件继续收窄，例如再与 `ret == 5` 相交后可以精确输出。
+结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。每次可建模的 syscall 都建立一个包含独立 `ret` / `errno` symbol 的 event；comparison 和 bind event 只传播该 event 的 provenance，不解释 C 表达式来合成比较约束。断言适配器把成功条件交给 Clang `assume()`，已知 failure API 被建模为 sink；到达正常函数出口时，checker 直接读取 Clang `ProgramState` 中的 `RangeSet`，再把范围投影到输出 schema。对取负等可逆且保持有符号整数语义的派生 symbol，投影层会把 Clang 已求得的范围映射回 event 字段；signedness 改变、narrowing 或其他无法证明可逆的转换会被过滤，不存在 AST 比较式回退。
+
+同一 assertion 的成功路径按 event 聚合，并且仅在另一字段范围相同时对 `ret` 或 `errno` 做精确并集。因此 `A || true` 会自然并成无约束而不输出，`ret` / `errno` 的分支相关性也不会被错误交叉组合。范围只在输出边界投影成当前 schema 的单个比较式：例如 `ret >= 0 && ret >= 1` 可投影为 `ret >= 1`，最终仍为 `0 <= ret && ret < 10` 时会保守过滤；中间范围若继续被 `ret == 5` 收窄，则可以精确输出。未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束同样都会被过滤。
 
 当前 checker 处理：
 
 - 直接或经可内联 wrapper 调用的 libc `syscall`；
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
-- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并识别已知的失败分支；不依赖 `__exp` / `__seen` 之类临时变量名；
+- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并为 `ksft_test_result` 和 nolibc 风格 syscall assertion helper 提供薄语义适配；不依赖 `__exp` / `__seen` 之类临时变量名；
 - syscall 返回值以及紧随其后的 `errno` 约束；
 - 指向具体结构体和字符串的 syscall 参数快照。
 
-控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加语义模型，而不是复制一套 C/C++ 执行器。
-predicate 临时值的来源随 analyzer 的 bind event 保存在 `ProgramState` 中，重新赋值或内存失效会自然覆盖该来源。已知 failure API 被建模为 sink；分支是否确定失败由 Clang CFG 上的可达性决定，而不是递归解释 AST 语句。
+控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 保存在 `ProgramState` 中，重新赋值或内存失效会覆盖该来源；普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
 
 ## 目录
 
