@@ -946,6 +946,43 @@ static Provenance provenanceFromSVal(SVal Value, ProgramStateRef State,
   return Result;
 }
 
+static Provenance provenanceFromValue(SVal Value, ProgramStateRef State,
+                                      QualType ObservedType,
+                                      ASTContext &Context) {
+  Provenance Result = provenanceFromSVal(Value, State, ObservedType, Context);
+  if (!ObservedType->isIntegerType())
+    return Result;
+  const MemRegion *Region = Value.getAsRegion();
+  if (!Region)
+    return Result;
+  if (const Provenance *const *Stored = State->get<ProvenanceByRegion>(Region))
+    mergeProvenance(Result, **Stored);
+  const auto *Typed = dyn_cast<TypedValueRegion>(Region);
+  if (!Typed)
+    return Result;
+  SVal StoredValue = State->getSVal(Region, Typed->getValueType());
+  if (StoredValue != Value)
+    mergeProvenance(Result, provenanceFromSVal(StoredValue, State,
+                                               Typed->getValueType(), Context));
+  return Result;
+}
+
+static bool regionsOverlap(const MemRegion *LHS, const MemRegion *RHS) {
+  return LHS && RHS && (LHS->isSubRegionOf(RHS) || RHS->isSubRegionOf(LHS));
+}
+
+static ProgramStateRef
+removeOverlappingRegionProvenance(ProgramStateRef State,
+                                  const MemRegion *Changed) {
+  std::vector<const MemRegion *> ToRemove;
+  for (const auto &Entry : State->get<ProvenanceByRegion>())
+    if (regionsOverlap(Entry.first, Changed))
+      ToRemove.push_back(Entry.first);
+  for (const MemRegion *Region : ToRemove)
+    State = State->remove<ProvenanceByRegion>(Region);
+  return State;
+}
+
 static EvaluationSite evaluationSite(const Expr *Expression,
                                      CheckerContext &C) {
   return {Expression, C.getLocationContext()};
@@ -1006,8 +1043,8 @@ static void collectDirectProvenance(const Expr *Expression, CheckerContext &C,
   if (!Expression)
     return;
   Provenance Direct =
-      provenanceFromSVal(currentValue(Expression, C), C.getState(),
-                         Expression->getType(), C.getASTContext());
+      provenanceFromValue(currentValue(Expression, C), C.getState(),
+                          Expression->getType(), C.getASTContext());
   mergeProvenance(EventProvenance, Direct);
 }
 
@@ -1021,6 +1058,8 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
     return;
 
   collectDirectProvenance(ValueExpression, C, EventProvenance);
+  if (Expression != ValueExpression)
+    collectDirectProvenance(Expression, C, EventProvenance);
 
   if (const Provenance *const *Stored =
           C.getState()->get<ProvenanceByEvaluationSite>(
@@ -1125,14 +1164,19 @@ static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
 }
 
 class SyscallScenarioChecker
-    : public Checker<eval::Call, check::PreCall, check::Bind,
-                     check::LiveSymbols, check::PreStmt<ReturnStmt>,
-                     check::PostStmt<ImplicitCastExpr>,
-                     check::PostStmt<BinaryOperator>, check::BeginFunction,
-                     check::EndFunction, check::BranchCondition> {
-  static const Expr *bindingSource(const VarDecl *Variable,
-                                   const Stmt *Statement) {
+    : public Checker<
+          eval::Call, check::PreCall, check::Bind, check::LiveSymbols,
+          check::RegionChanges, check::PreStmt<ReturnStmt>,
+          check::PostStmt<ImplicitCastExpr>, check::PostStmt<BinaryOperator>,
+          check::BeginFunction, check::EndFunction, check::BranchCondition> {
+  static const Expr *fallbackBindingSource(const MemRegion *Region,
+                                           const Stmt *Statement) {
+    const auto *VariableRegion = dyn_cast_or_null<VarRegion>(Region);
+    const VarDecl *Variable =
+        VariableRegion ? VariableRegion->getDecl() : nullptr;
     if (const auto *Declaration = dyn_cast_or_null<DeclStmt>(Statement)) {
+      if (!Variable)
+        return nullptr;
       for (const Decl *D : Declaration->decls()) {
         const auto *BoundVariable = dyn_cast<VarDecl>(D);
         if (BoundVariable == Variable)
@@ -1297,6 +1341,28 @@ class SyscallScenarioChecker
   }
 
 public:
+  ProgramStateRef
+  checkRegionChanges(ProgramStateRef State,
+                     const InvalidatedSymbols *Invalidated,
+                     llvm::ArrayRef<const MemRegion *> ExplicitRegions,
+                     llvm::ArrayRef<const MemRegion *> Regions,
+                     const LocationContext *, const CallEvent *Call) const {
+    // ExprEngine reports an ordinary bind after checkBind() as one identical
+    // explicit/changed region with no call or invalidated-symbol set.
+    // checkBind() already replaced the overlapping provenance, so processing
+    // that notification here would immediately erase the new binding.
+    bool OrdinaryBind = !Call && !Invalidated && ExplicitRegions.size() == 1 &&
+                        Regions.size() == 1 &&
+                        ExplicitRegions.front() == Regions.front();
+    if (OrdinaryBind)
+      return State;
+    for (const MemRegion *Region : ExplicitRegions)
+      State = removeOverlappingRegionProvenance(State, Region);
+    for (const MemRegion *Region : Regions)
+      State = removeOverlappingRegionProvenance(State, Region);
+    return State;
+  }
+
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &Reaper) const {
     auto MarkProvenance = [&](const Provenance *Value) {
       for (const EventOrigin &Origin : Value->origins)
@@ -1314,6 +1380,8 @@ public:
     }
     for (const auto &Entry : State->get<ProvenanceByEvaluationSite>())
       MarkProvenance(Entry.second);
+    for (const auto &Entry : State->get<ProvenanceByRegion>())
+      MarkProvenance(Entry.second);
     for (const auto &Entry : State->get<SValByEvaluationSite>())
       if (SymbolRef Symbol = Entry.second.getAsSymbol(true))
         Reaper.markLive(Symbol);
@@ -1321,21 +1389,22 @@ public:
 
   void checkBind(SVal Location, SVal Value, const Stmt *Statement,
                  CheckerContext &C) const {
-    const auto *Region = dyn_cast_or_null<VarRegion>(Location.getAsRegion());
-    const VarDecl *Variable = Region ? Region->getDecl() : nullptr;
-    if (!Variable)
+    const auto *Region =
+        dyn_cast_or_null<TypedValueRegion>(Location.getAsRegion());
+    if (!Region)
       return;
 
-    ProgramStateRef State = C.getState();
-    if (State->get<ProvenanceByRegion>(Region))
-      State = State->remove<ProvenanceByRegion>(Region);
+    ProgramStateRef State =
+        removeOverlappingRegionProvenance(C.getState(), Region);
 
     if (ActiveCollector) {
-      Provenance EventProvenance = provenanceFromSVal(
-          Value, C.getState(), Variable->getType(), C.getASTContext());
-      const Expr *Source = bindingSource(Variable, Statement);
-      if (Source)
-        collectProvenance(Source, C, EventProvenance);
+      Provenance EventProvenance = provenanceFromValue(
+          Value, C.getState(), Region->getValueType(), C.getASTContext());
+      if (EventProvenance.projections.empty()) {
+        const Expr *Source = fallbackBindingSource(Region, Statement);
+        if (Source)
+          collectProvenance(Source, C, EventProvenance);
+      }
       if (!EventProvenance.origins.empty()) {
         const Provenance *Binding =
             ActiveCollector->makeProvenance(std::move(EventProvenance));

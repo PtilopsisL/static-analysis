@@ -245,6 +245,30 @@ class ExtractionTests(unittest.TestCase):
             self.extract("short_circuit_eval_site_is_fresh")["records"], []
         )
 
+    def test_field_region_propagates_predicate_provenance(self):
+        record, = self.extract("field_predicate_tracks_event")["records"]
+        self.assertEqual(record["args"], [623, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
+
+    def test_parent_write_invalidates_field_provenance(self):
+        self.assertEqual(
+            self.extract("parent_write_invalidates_field_provenance")["records"],
+            [],
+        )
+
+    def test_whole_object_write_invalidates_field_provenance(self):
+        self.assertEqual(
+            self.extract("whole_object_write_invalidates_field_provenance")[
+                "records"
+            ],
+            [],
+        )
+
+    def test_array_element_region_propagates_predicate_provenance(self):
+        record, = self.extract("array_element_predicate_tracks_event")["records"]
+        self.assertEqual(record["args"], [626, 0, 0])
+        self.assertEqual(record["result"], {"ret": {"op": "==", "value": 0}})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

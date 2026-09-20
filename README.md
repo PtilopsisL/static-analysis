@@ -130,7 +130,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 - syscall 返回值以及紧随其后的 `errno` 约束；
 - 指向具体结构体和字符串的 syscall 参数快照。
 
-控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 保存在 `ProgramState` 中，重新赋值或内存失效会覆盖该来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
+控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
 
 ## 目录
 

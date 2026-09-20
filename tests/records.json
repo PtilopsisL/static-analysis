@@ -670,5 +670,33 @@
       }
     },
     "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      623,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
+  },
+  {
+    "args": [
+      626,
+      0,
+      0
+    ],
+    "result": {
+      "ret": {
+        "op": "==",
+        "value": 0
+      }
+    },
+    "syscall": "pidfd_getfd"
   }
 ]

@@ -20,6 +20,10 @@ struct open_how {
   unsigned long long resolve;
 };
 
+struct predicate_box {
+  int ok;
+};
+
 #define TEST(name) static void name(void)
 #define EXPECT_OP(expected, seen, op)                                      \
   do {                                                                    \
@@ -40,6 +44,7 @@ struct open_how {
 extern void unrelated_call(void);
 extern int unknown_value(void);
 extern void mutate(int *value);
+extern void mutate_predicate_box(struct predicate_box *box);
 extern void abort(void) __attribute__((noreturn));
 extern void exit_success(void) __attribute__((noreturn));
 extern void ksft_test_result(int condition, const char *format, ...);
@@ -293,4 +298,38 @@ TEST(short_circuit_eval_site_is_fresh) {
     if (i == 1)
       ksft_test_result(ok, "tautology remains independent of prior event\n");
   }
+}
+
+TEST(field_predicate_tracks_event) {
+  long ret = getfd(623, 0, 0);
+  struct predicate_box box;
+  box.ok = ret == 0;
+  if (!box.ok)
+    abort();
+}
+
+TEST(parent_write_invalidates_field_provenance) {
+  long ret = getfd(624, 0, 0);
+  struct predicate_box box;
+  box.ok = ret == 0;
+  mutate_predicate_box(&box);
+  if (!box.ok)
+    abort();
+}
+
+TEST(whole_object_write_invalidates_field_provenance) {
+  long ret = getfd(625, 0, 0);
+  struct predicate_box box;
+  box.ok = ret == 0;
+  box = (struct predicate_box){.ok = 1};
+  if (!box.ok)
+    abort();
+}
+
+TEST(array_element_predicate_tracks_event) {
+  long ret = getfd(626, 0, 0);
+  int ok[2];
+  ok[1] = ret == 0;
+  if (!ok[1])
+    abort();
 }
