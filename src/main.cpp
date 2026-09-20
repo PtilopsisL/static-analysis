@@ -317,36 +317,51 @@ struct Invocation {
   bool concrete = false;
 };
 
+enum class EventField : uint8_t {
+  Result,
+  Errno,
+};
+
+enum class ProjectionTransform : uint8_t {
+  Identity,
+  Negate,
+};
+
 struct SymbolOwner {
   const Invocation *call = nullptr;
-  bool error = false;
+  EventField field = EventField::Result;
 
   bool operator==(const SymbolOwner &Other) const {
-    return call == Other.call && error == Other.error;
+    return call == Other.call && field == Other.field;
   }
 
   void Profile(llvm::FoldingSetNodeID &ID) const {
     ID.AddPointer(call);
-    ID.AddBoolean(error);
+    ID.AddInteger(static_cast<unsigned>(field));
   }
 };
 
-struct Subject {
+struct EventOrigin {
   const Invocation *call = nullptr;
-  bool error = false;
-  SymbolRef symbol = nullptr;
+  EventField field = EventField::Result;
+  SymbolRef atom = nullptr;
+};
+
+struct ProjectionSubject {
+  EventOrigin origin;
   SymbolRef constrainedSymbol = nullptr;
-  bool negated = false;
+  ProjectionTransform transform = ProjectionTransform::Identity;
 };
 
 struct Provenance {
-  std::vector<Subject> subjects;
+  std::vector<EventOrigin> origins;
+  std::vector<ProjectionSubject> projections;
 };
 
 struct AssertionMarker {
   const Expr *site = nullptr;
   const Invocation *call = nullptr;
-  std::vector<Subject> subjects;
+  std::vector<ProjectionSubject> projections;
   bool explicitAssertion = false;
 };
 
@@ -814,13 +829,13 @@ static std::optional<bool> relationToAtom(SymbolRef Expression, SymbolRef Atom,
   return Inner ? std::optional<bool>(!*Inner) : std::nullopt;
 }
 
-static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
-                                          QualType ObservedType,
-                                          ASTContext &Context) {
+static std::optional<ProjectionSubject>
+findProjectionSubject(SVal Value, ProgramStateRef State, QualType ObservedType,
+                      ASTContext &Context) {
   SymbolRef ConstrainedSymbol = Value.getAsSymbol(true);
   if (!ConstrainedSymbol)
     return std::nullopt;
-  std::optional<Subject> Found;
+  std::optional<ProjectionSubject> Found;
   for (SymbolRef Atom : Value.symbols()) {
     const SymbolOwner *Owner = State->get<SymbolOwners>(Atom);
     if (!Owner)
@@ -834,11 +849,14 @@ static std::optional<Subject> findSubject(SVal Value, ProgramStateRef State,
     auto Negated = relationToAtom(ConstrainedSymbol, Atom, Context);
     if (!Negated)
       return std::nullopt;
-    if (Found && (Found->call != Owner->call || Found->symbol != Atom ||
-                  Found->error != Owner->error))
+    EventOrigin Origin{Owner->call, Owner->field, Atom};
+    if (Found && (Found->origin.call != Origin.call ||
+                  Found->origin.field != Origin.field ||
+                  Found->origin.atom != Origin.atom))
       return std::nullopt;
-    Found =
-        Subject{Owner->call, Owner->error, Atom, ConstrainedSymbol, *Negated};
+    Found = ProjectionSubject{Origin, ConstrainedSymbol,
+                              *Negated ? ProjectionTransform::Negate
+                                       : ProjectionTransform::Identity};
   }
   return Found;
 }
@@ -853,29 +871,50 @@ static SVal currentValue(const Expr *Expression, CheckerContext &C) {
   return C.getState()->getSVal(Location, Variable->getType());
 }
 
-static void appendSubject(std::vector<Subject> &Subjects, Subject Value) {
-  auto Same = [&](const Subject &Existing) {
-    return Existing.call == Value.call && Existing.error == Value.error &&
-           Existing.symbol == Value.symbol &&
-           Existing.constrainedSymbol == Value.constrainedSymbol &&
-           Existing.negated == Value.negated;
-  };
-  if (std::none_of(Subjects.begin(), Subjects.end(), Same))
-    Subjects.push_back(Value);
+static bool sameOrigin(const EventOrigin &LHS, const EventOrigin &RHS) {
+  return LHS.call == RHS.call && LHS.field == RHS.field && LHS.atom == RHS.atom;
 }
 
-static void collectDirectSubject(const Expr *Expression, CheckerContext &C,
-                                 std::vector<Subject> &Subjects) {
+static void appendOrigin(std::vector<EventOrigin> &Origins, EventOrigin Value) {
+  if (std::none_of(Origins.begin(), Origins.end(),
+                   [&](const EventOrigin &Existing) {
+                     return sameOrigin(Existing, Value);
+                   }))
+    Origins.push_back(Value);
+}
+
+static void appendProjection(Provenance &EventProvenance,
+                             ProjectionSubject Value) {
+  appendOrigin(EventProvenance.origins, Value.origin);
+  auto Same = [&](const ProjectionSubject &Existing) {
+    return sameOrigin(Existing.origin, Value.origin) &&
+           Existing.constrainedSymbol == Value.constrainedSymbol &&
+           Existing.transform == Value.transform;
+  };
+  if (std::none_of(EventProvenance.projections.begin(),
+                   EventProvenance.projections.end(), Same))
+    EventProvenance.projections.push_back(Value);
+}
+
+static void mergeProvenance(Provenance &Destination, const Provenance &Source) {
+  for (const EventOrigin &Origin : Source.origins)
+    appendOrigin(Destination.origins, Origin);
+  for (const ProjectionSubject &Projection : Source.projections)
+    appendProjection(Destination, Projection);
+}
+
+static void collectDirectProvenance(const Expr *Expression, CheckerContext &C,
+                                    Provenance &EventProvenance) {
   if (!Expression)
     return;
-  if (auto Found = findSubject(currentValue(Expression, C), C.getState(),
-                               Expression->getType(), C.getASTContext()))
-    appendSubject(Subjects, *Found);
+  if (auto Found =
+          findProjectionSubject(currentValue(Expression, C), C.getState(),
+                                Expression->getType(), C.getASTContext()))
+    appendProjection(EventProvenance, *Found);
 }
 
 static void collectProvenance(const Expr *Expression, CheckerContext &C,
-                              std::vector<Subject> &Subjects,
-                              unsigned Depth = 0) {
+                              Provenance &EventProvenance, unsigned Depth = 0) {
   if (!Expression || Depth > 32)
     return;
   const Expr *ValueExpression = Expression;
@@ -884,7 +923,7 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
     return;
 
   if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
-    collectDirectSubject(Expression, C, Subjects);
+    collectDirectProvenance(Expression, C, EventProvenance);
     const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
     if (!Variable)
       return;
@@ -893,8 +932,7 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
     const Provenance *const *Stored =
         Region ? C.getState()->get<ProvenanceByRegion>(Region) : nullptr;
     if (Stored)
-      for (const Subject &Subject : (*Stored)->subjects)
-        appendSubject(Subjects, Subject);
+      mergeProvenance(EventProvenance, **Stored);
     return;
   }
 
@@ -902,26 +940,24 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
     if (Binary->isComparisonOp()) {
       const Provenance *const *Stored =
           C.getState()->get<ProvenanceByComparison>(Binary);
-      if (Stored) {
-        for (const Subject &Subject : (*Stored)->subjects)
-          appendSubject(Subjects, Subject);
-      }
+      if (Stored)
+        mergeProvenance(EventProvenance, **Stored);
       return;
     }
     if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
-      collectProvenance(Binary->getLHS(), C, Subjects, Depth + 1);
-      collectProvenance(Binary->getRHS(), C, Subjects, Depth + 1);
+      collectProvenance(Binary->getLHS(), C, EventProvenance, Depth + 1);
+      collectProvenance(Binary->getRHS(), C, EventProvenance, Depth + 1);
       return;
     }
   }
 
   if (const auto *Unary = dyn_cast<UnaryOperator>(Expression)) {
     if (Unary->getOpcode() == UO_LNot) {
-      collectProvenance(Unary->getSubExpr(), C, Subjects, Depth + 1);
+      collectProvenance(Unary->getSubExpr(), C, EventProvenance, Depth + 1);
       return;
     }
   }
-  collectDirectSubject(ValueExpression, C, Subjects);
+  collectDirectProvenance(ValueExpression, C, EventProvenance);
 }
 
 static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
@@ -1009,14 +1045,15 @@ class SyscallScenarioChecker
   }
 
   static ProgramStateRef addMarkers(ProgramStateRef State, const Expr *Site,
-                                    const std::vector<Subject> &Subjects,
+                                    const Provenance &EventProvenance,
                                     bool ExplicitAssertion) {
-    std::map<const Invocation *, std::vector<Subject>> ByCall;
-    for (const Subject &Subject : Subjects)
-      ByCall[Subject.call].push_back(Subject);
-    for (auto &[Call, CallSubjects] : ByCall) {
+    std::map<const Invocation *, Provenance> ByCall;
+    for (const ProjectionSubject &Projection : EventProvenance.projections)
+      appendProjection(ByCall[Projection.origin.call], Projection);
+    for (auto &[Call, CallProvenance] : ByCall) {
       const AssertionMarker *Marker = ActiveCollector->makeAssertionMarker(
-          {Site, Call, std::move(CallSubjects), ExplicitAssertion});
+          {Site, Call, std::move(CallProvenance.projections),
+           ExplicitAssertion});
       State = ExplicitAssertion ? State->add<PendingAssertions>(Marker)
                                 : State->add<ActiveGuards>(Marker);
     }
@@ -1025,9 +1062,9 @@ class SyscallScenarioChecker
 
   static void applyAssertion(const Expr *Expression, bool Expected,
                              CheckerContext &C) {
-    std::vector<Subject> Subjects;
-    collectProvenance(Expression, C, Subjects);
-    if (Subjects.empty())
+    Provenance EventProvenance;
+    collectProvenance(Expression, C, EventProvenance);
+    if (EventProvenance.projections.empty())
       return;
     ProgramStateRef Base = C.getState();
     if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
@@ -1037,7 +1074,7 @@ class SyscallScenarioChecker
         return;
       }
     }
-    Base = addMarkers(Base, Expression, Subjects, true);
+    Base = addMarkers(Base, Expression, EventProvenance, true);
     C.addTransition(Base);
   }
 
@@ -1059,10 +1096,10 @@ class SyscallScenarioChecker
     if (!SysEq && !SysZero && !SysError)
       return false;
 
-    std::vector<Subject> Subjects;
+    Provenance EventProvenance;
     if (const Expr *Argument = Call.getArgExpr(0))
-      collectProvenance(Argument, C, Subjects);
-    if (Subjects.empty())
+      collectProvenance(Argument, C, EventProvenance);
+    if (EventProvenance.projections.empty())
       return true;
     ProgramStateRef State = C.getState();
     SVal Expected =
@@ -1077,10 +1114,11 @@ class SyscallScenarioChecker
 
     if (SysError) {
       std::vector<const Invocation *> Calls;
-      for (const Subject &Subject : Subjects)
-        if (!Subject.error &&
-            std::find(Calls.begin(), Calls.end(), Subject.call) == Calls.end())
-          Calls.push_back(Subject.call);
+      for (const ProjectionSubject &Projection : EventProvenance.projections)
+        if (Projection.origin.field == EventField::Result &&
+            std::find(Calls.begin(), Calls.end(), Projection.origin.call) ==
+                Calls.end())
+          Calls.push_back(Projection.origin.call);
       for (const Invocation *Invocation : Calls) {
         if (!Invocation->errnoSymbol)
           continue;
@@ -1090,22 +1128,25 @@ class SyscallScenarioChecker
           C.addSink();
           return true;
         }
-        appendSubject(Subjects, {Invocation, true, Invocation->errnoSymbol,
-                                 Invocation->errnoSymbol, false});
+        appendProjection(EventProvenance, {{Invocation, EventField::Errno,
+                                            Invocation->errnoSymbol},
+                                           Invocation->errnoSymbol,
+                                           ProjectionTransform::Identity});
       }
     }
 
     const Expr *Site = Call.getOriginExpr();
-    State = addMarkers(State, Site, Subjects, true);
+    State = addMarkers(State, Site, EventProvenance, true);
     C.addTransition(State);
     return true;
   }
 
   static void registerGuard(const Expr *Expression, CheckerContext &C) {
-    std::vector<Subject> Subjects;
-    collectProvenance(Expression, C, Subjects);
-    if (!Subjects.empty())
-      C.addTransition(addMarkers(C.getState(), Expression, Subjects, false));
+    Provenance EventProvenance;
+    collectProvenance(Expression, C, EventProvenance);
+    if (!EventProvenance.projections.empty())
+      C.addTransition(
+          addMarkers(C.getState(), Expression, EventProvenance, false));
   }
 
   static void markFailureGuards(ProgramStateRef State) {
@@ -1119,18 +1160,20 @@ class SyscallScenarioChecker
   domainsForMarker(const AssertionMarker *Marker, ProgramStateRef State) {
     ConstraintDomains Domains;
     ConstraintMap ClangConstraints = getConstraintMap(State);
-    for (const Subject &Subject : Marker->subjects) {
+    for (const ProjectionSubject &Projection : Marker->projections) {
       IntegerDomain Incoming = fullDomain();
       if (const RangeSet *Ranges =
-              ClangConstraints.lookup(Subject.constrainedSymbol)) {
+              ClangConstraints.lookup(Projection.constrainedSymbol)) {
         auto FromClang = domainForRangeSet(*Ranges);
         if (!FromClang)
           return std::nullopt;
-        Incoming = Subject.negated ? negateDomain(std::move(*FromClang))
-                                   : std::move(*FromClang);
+        Incoming = Projection.transform == ProjectionTransform::Negate
+                       ? negateDomain(std::move(*FromClang))
+                       : std::move(*FromClang);
       }
-      if (Subject.constrainedSymbol != Subject.symbol) {
-        if (const RangeSet *Ranges = ClangConstraints.lookup(Subject.symbol)) {
+      if (Projection.constrainedSymbol != Projection.origin.atom) {
+        if (const RangeSet *Ranges =
+                ClangConstraints.lookup(Projection.origin.atom)) {
           auto FromClang = domainForRangeSet(*Ranges);
           if (!FromClang)
             return std::nullopt;
@@ -1139,7 +1182,8 @@ class SyscallScenarioChecker
         }
       }
       std::optional<IntegerDomain> &Slot =
-          Subject.error ? Domains.error : Domains.ret;
+          Projection.origin.field == EventField::Errno ? Domains.error
+                                                       : Domains.ret;
       Slot = Slot ? intersectDomains(std::move(*Slot), std::move(Incoming))
                   : std::move(Incoming);
       if (Slot->empty())
@@ -1168,16 +1212,16 @@ public:
       State = State->remove<ProvenanceByRegion>(Region);
 
     if (ActiveCollector) {
-      std::vector<Subject> Subjects;
-      if (auto Direct = findSubject(Value, C.getState(), Variable->getType(),
-                                    C.getASTContext()))
-        appendSubject(Subjects, *Direct);
+      Provenance EventProvenance;
+      if (auto Direct = findProjectionSubject(
+              Value, C.getState(), Variable->getType(), C.getASTContext()))
+        appendProjection(EventProvenance, *Direct);
       const Expr *Source = bindingSource(Variable, Statement);
       if (Source)
-        collectProvenance(Source, C, Subjects);
-      if (!Subjects.empty()) {
+        collectProvenance(Source, C, EventProvenance);
+      if (!EventProvenance.projections.empty()) {
         const Provenance *Binding =
-            ActiveCollector->makeProvenance({std::move(Subjects)});
+            ActiveCollector->makeProvenance(std::move(EventProvenance));
         State = State->set<ProvenanceByRegion>(Region, Binding);
       }
     }
@@ -1228,9 +1272,9 @@ public:
     ProgramStateRef State = C.getState()->BindExpr(
         Call.getOriginExpr(), C.getLocationContext(), Return);
     State = State->set<SymbolOwners>(Stored->resultSymbol,
-                                     SymbolOwner{Stored, false});
+                                     SymbolOwner{Stored, EventField::Result});
     State = State->set<SymbolOwners>(Stored->errnoSymbol,
-                                     SymbolOwner{Stored, true});
+                                     SymbolOwner{Stored, EventField::Errno});
     State = State->set<CurrentErrnoOwner>(Stored);
     C.addTransition(State);
     return true;
@@ -1271,16 +1315,16 @@ public:
     ProgramStateRef State = C.getState();
     if (State->get<ProvenanceByComparison>(Compare))
       State = State->remove<ProvenanceByComparison>(Compare);
-    std::vector<Subject> Subjects;
-    collectProvenance(Compare->getLHS(), C, Subjects);
-    collectProvenance(Compare->getRHS(), C, Subjects);
-    if (Subjects.empty()) {
+    Provenance EventProvenance;
+    collectProvenance(Compare->getLHS(), C, EventProvenance);
+    collectProvenance(Compare->getRHS(), C, EventProvenance);
+    if (EventProvenance.projections.empty()) {
       if (State != C.getState())
         C.addTransition(State);
       return;
     }
     const Provenance *Stored =
-        ActiveCollector->makeProvenance({std::move(Subjects)});
+        ActiveCollector->makeProvenance(std::move(EventProvenance));
     C.addTransition(State->set<ProvenanceByComparison>(Compare, Stored));
   }
 
@@ -1299,7 +1343,8 @@ public:
     ProgramStateRef State = C.getState();
     bool Changed = false;
     for (SymbolRef Atom : C.getSVal(Cast).symbols()) {
-      State = State->set<SymbolOwners>(Atom, SymbolOwner{Owner, true});
+      State =
+          State->set<SymbolOwners>(Atom, SymbolOwner{Owner, EventField::Errno});
       Changed = true;
     }
     if (Changed)
