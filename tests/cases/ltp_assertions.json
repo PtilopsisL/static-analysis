@@ -1,0 +1,79 @@
+{
+  "ltp_exp_pass": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [701, 70, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ltp_exp_positive": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [702, 71, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "ltp_exp_fail": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [703, 72, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ltp_exp_fail2": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [704, 73, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ltp_test_result_and_errno": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [705, 74, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ltp_tst_brk_failure_guard": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [706, 75, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "ltp_exp_eq_li": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [707, 76, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "ltp_exp_expr": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [708, 77, 0],
+      "result": {"ret": {"op": "!=", "value": -1}}
+    }
+  ],
+  "ltp_tst_syscall_fail": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [709, 78, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ltp_info_is_not_assertion": [],
+  "ltp_tconf_is_not_failure": []
+}
