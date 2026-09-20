@@ -670,6 +670,8 @@ static Collector *ActiveCollector = nullptr;
 static int ErrnoSymbolTag;
 
 REGISTER_MAP_WITH_PROGRAMSTATE(SymbolOwners, SymbolRef, SymbolOwner)
+REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceBySymbol, SymbolRef,
+                               const Provenance *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByComparison, const BinaryOperator *,
                                const Provenance *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByRegion, const MemRegion *,
@@ -903,14 +905,33 @@ static void mergeProvenance(Provenance &Destination, const Provenance &Source) {
     appendProjection(Destination, Projection);
 }
 
+static Provenance provenanceFromSVal(SVal Value, ProgramStateRef State,
+                                     QualType ObservedType,
+                                     ASTContext &Context) {
+  Provenance Result;
+  for (SymbolRef Atom : Value.symbols()) {
+    if (const SymbolOwner *Owner = State->get<SymbolOwners>(Atom))
+      appendOrigin(Result.origins, {Owner->call, Owner->field, Atom});
+  }
+  if (SymbolRef Symbol = Value.getAsSymbol(true)) {
+    if (const Provenance *const *Stored =
+            State->get<ProvenanceBySymbol>(Symbol))
+      mergeProvenance(Result, **Stored);
+  }
+  if (auto Projection =
+          findProjectionSubject(Value, State, ObservedType, Context))
+    appendProjection(Result, *Projection);
+  return Result;
+}
+
 static void collectDirectProvenance(const Expr *Expression, CheckerContext &C,
                                     Provenance &EventProvenance) {
   if (!Expression)
     return;
-  if (auto Found =
-          findProjectionSubject(currentValue(Expression, C), C.getState(),
-                                Expression->getType(), C.getASTContext()))
-    appendProjection(EventProvenance, *Found);
+  Provenance Direct =
+      provenanceFromSVal(currentValue(Expression, C), C.getState(),
+                         Expression->getType(), C.getASTContext());
+  mergeProvenance(EventProvenance, Direct);
 }
 
 static void collectProvenance(const Expr *Expression, CheckerContext &C,
@@ -922,8 +943,9 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
   if (!Expression)
     return;
 
+  collectDirectProvenance(ValueExpression, C, EventProvenance);
+
   if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
-    collectDirectProvenance(Expression, C, EventProvenance);
     const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
     if (!Variable)
       return;
@@ -957,7 +979,6 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
       return;
     }
   }
-  collectDirectProvenance(ValueExpression, C, EventProvenance);
 }
 
 static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
@@ -1198,6 +1219,15 @@ public:
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &Reaper) const {
     for (const auto &Entry : State->get<SymbolOwners>())
       Reaper.markLive(Entry.first);
+    for (const auto &Entry : State->get<ProvenanceBySymbol>()) {
+      Reaper.markLive(Entry.first);
+      for (const EventOrigin &Origin : Entry.second->origins)
+        Reaper.markLive(Origin.atom);
+      for (const ProjectionSubject &Projection : Entry.second->projections) {
+        Reaper.markLive(Projection.origin.atom);
+        Reaper.markLive(Projection.constrainedSymbol);
+      }
+    }
   }
 
   void checkBind(SVal Location, SVal Value, const Stmt *Statement,
@@ -1212,17 +1242,17 @@ public:
       State = State->remove<ProvenanceByRegion>(Region);
 
     if (ActiveCollector) {
-      Provenance EventProvenance;
-      if (auto Direct = findProjectionSubject(
-              Value, C.getState(), Variable->getType(), C.getASTContext()))
-        appendProjection(EventProvenance, *Direct);
+      Provenance EventProvenance = provenanceFromSVal(
+          Value, C.getState(), Variable->getType(), C.getASTContext());
       const Expr *Source = bindingSource(Variable, Statement);
       if (Source)
         collectProvenance(Source, C, EventProvenance);
-      if (!EventProvenance.projections.empty()) {
+      if (!EventProvenance.origins.empty()) {
         const Provenance *Binding =
             ActiveCollector->makeProvenance(std::move(EventProvenance));
         State = State->set<ProvenanceByRegion>(Region, Binding);
+        if (SymbolRef Symbol = Value.getAsSymbol(true))
+          State = State->set<ProvenanceBySymbol>(Symbol, Binding);
       }
     }
     if (State != C.getState())
@@ -1315,17 +1345,23 @@ public:
     ProgramStateRef State = C.getState();
     if (State->get<ProvenanceByComparison>(Compare))
       State = State->remove<ProvenanceByComparison>(Compare);
+    SymbolRef ResultSymbol = C.getSVal(Compare).getAsSymbol(true);
+    if (ResultSymbol && State->get<ProvenanceBySymbol>(ResultSymbol))
+      State = State->remove<ProvenanceBySymbol>(ResultSymbol);
     Provenance EventProvenance;
     collectProvenance(Compare->getLHS(), C, EventProvenance);
     collectProvenance(Compare->getRHS(), C, EventProvenance);
-    if (EventProvenance.projections.empty()) {
+    if (EventProvenance.origins.empty()) {
       if (State != C.getState())
         C.addTransition(State);
       return;
     }
     const Provenance *Stored =
         ActiveCollector->makeProvenance(std::move(EventProvenance));
-    C.addTransition(State->set<ProvenanceByComparison>(Compare, Stored));
+    State = State->set<ProvenanceByComparison>(Compare, Stored);
+    if (ResultSymbol)
+      State = State->set<ProvenanceBySymbol>(ResultSymbol, Stored);
+    C.addTransition(State);
   }
 
   void checkPostStmt(const ImplicitCastExpr *Cast, CheckerContext &C) const {
