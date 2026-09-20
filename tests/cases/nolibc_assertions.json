@@ -1,0 +1,26 @@
+{
+  "nolibc_equal": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [501, 50, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "nolibc_error": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [503, 52, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 14}
+      }
+    }
+  ],
+  "nolibc_zero": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [502, 51, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ]
+}

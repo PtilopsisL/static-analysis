@@ -132,11 +132,14 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 
 控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
 
+`argument_ranges` 测试定义了 argument domain 的目标表示：单值仍直接写成 JSON 值；其他情况写成 `{"domain": [...]}`。`domain` 的列表元素之间为 OR，数字表示一个离散点，比较对象中的字段为 AND。例如 `[1, 2, 4, 8, {">": 20, "<=": 30}]` 表示 `{1, 2, 4, 8}` 与 `20 < arg <= 30` 的并集。只有其他参数和 result 相同、无需保留跨参数相关性时，才能把这些候选合并到同一条 record。
+
 ## 目录
 
 - `src/main.cpp`：编译数据库驱动、Static Analyzer checker 和结果收集。
 - `scan_artifacts.py`：compilation database 批量扫描、隔离和汇总。
 - `limit_worker.py`：分析子进程资源限制。
-- `tests/src/fixtures.c`：静态分析回归输入。
-- `tests/records.json`：无序严格比较的标准 records。
-- `tests/`：核心提取和批量扫描测试。
+- `tests/cases/*.c`：按函数组织的静态分析输入。
+- `tests/cases/*.json`：与同名 C 文件配对、按函数名索引的预期 records。
+- `tests/test_records.py`：自动批量发现所有 C/JSON 测试对并逐函数比较。
+- `tests/test_scanner.py`：批量扫描、进程隔离和资源限制测试。

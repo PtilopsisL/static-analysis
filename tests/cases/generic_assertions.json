@@ -1,0 +1,33 @@
+{
+  "arbitrary_temporary_names": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [101, 10, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "negated_result": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [104, 13, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "reversed_comparison_with_cast": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [103, 12, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "syscall_as_assertion_operand": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [102, 11, 0],
+      "result": {"ret": {"op": "!=", "value": 0}}
+    }
+  ]
+}

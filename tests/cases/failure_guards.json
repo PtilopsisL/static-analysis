@@ -1,0 +1,33 @@
+{
+  "abort_failure_guard": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [202, 21, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "direct_syscall_guard": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [204, 23, 0],
+      "result": {"ret": {"op": "!=", "value": -1}}
+    }
+  ],
+  "failure_return_guard": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [203, 22, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_failure_guard": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [201, 20, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ]
+}

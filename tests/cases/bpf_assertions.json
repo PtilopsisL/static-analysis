@@ -1,0 +1,33 @@
+{
+  "bpf_equal_with_errno": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [401, 40, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 71}
+      }
+    }
+  ],
+  "bpf_err": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [404, 43, 0],
+      "result": {"ret": {"op": "<=", "value": -1}}
+    }
+  ],
+  "bpf_not_equal": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [402, 41, 0],
+      "result": {"ret": {"op": "!=", "value": 0}}
+    }
+  ],
+  "bpf_ok": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [403, 42, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+{
+  "argument_loop_range": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">=": 0, "<": 5}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_strict_open_range": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">": 0, "<": 10}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_mixed_open_closed_range": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">=": 0, "<": 10}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_equality_stays_concrete": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [5, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_not_equal_constraint": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {"!=": 5}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_disjoint_ranges": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {"<": 0},
+            {">": 10}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_range_result_correlation": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">": 0, "<": 10}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    },
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">=": 20, "<=": 30}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "argument_range_is_narrowed_at_assertion": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [5, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_discrete_values_stay_concrete": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"domain": [1, 2, 4, 8, 16]},
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_values_and_range_union": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            1,
+            2,
+            4,
+            8,
+            {">": 20, "<=": 30}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ]
+}

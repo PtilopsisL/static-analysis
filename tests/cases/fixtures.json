@@ -1,0 +1,244 @@
+{
+  "array_element_predicate_tracks_event": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [626, 0, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "assertion_temporary_lookalike": [],
+  "both_branches_fail": [],
+  "clang_path_constraint_strengthens_assertion": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [616, 0, 0],
+      "result": {"ret": {"op": ">=", "value": 1}}
+    }
+  ],
+  "clang_selects_feasible_disjunct": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [617, 0, 0],
+      "result": {"ret": {"op": "==", "value": 2}}
+    }
+  ],
+  "clang_unions_success_paths": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [618, 0, 0],
+      "result": {"ret": {"op": "<=", "value": 0}}
+    }
+  ],
+  "command_line_define": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [17, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "compound_constraint_strengthening": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [600, 0, 0],
+      "result": {"ret": {"op": ">=", "value": 1}}
+    }
+  ],
+  "compound_failure_condition": [],
+  "constant_error": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [0, 0, 1],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "definite_failure_via_cfg": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [611, 0, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "domain_refinement_becomes_projectable": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [615, 0, 0],
+      "result": {"ret": {"op": "==", "value": 5}}
+    }
+  ],
+  "errno_range_uses_integer_type_limits": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [620, 0, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "!=", "value": 0}
+      }
+    }
+  ],
+  "field_predicate_tracks_event": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [623, 0, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "guarded_error": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [0, 0, 1],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "limited_loop": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        {
+          "domain": [
+            {">=": 0, "<": 5}
+          ]
+        },
+        0,
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "nested_possible_failure": [],
+  "opaque_pointer_write": [],
+  "parent_write_invalidates_field_provenance": [],
+  "predicate_assignment_tracks_new_value": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [614, 0, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "predicate_invalidated_by_opaque_write": [],
+  "predicate_reassigned_after_assertion": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [610, 0, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "reassigned_predicate_variable": [],
+  "reassignment": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [9, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "separate_calls": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [1, 2, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    },
+    {
+      "syscall": "pidfd_getfd",
+      "args": [3, 4, 1],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "short_circuit_eval_site_is_fresh": [],
+  "stale_errno": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [0, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "success_paths_preserve_result_errno_correlation": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [619, 0, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    },
+    {
+      "syscall": "pidfd_getfd",
+      "args": [619, 0, 0],
+      "result": {
+        "ret": {"op": "==", "value": -2},
+        "errno": {"op": "==", "value": 5}
+      }
+    }
+  ],
+  "table_pairs": [
+    {
+      "syscall": "pidfd_open",
+      "args": [-1, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    },
+    {
+      "syscall": "pidfd_open",
+      "args": [123, 1],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 3}
+      }
+    },
+    {
+      "syscall": "pidfd_open",
+      "args": [456, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "unconstrained_success_alternative": [],
+  "unknown_argument": [],
+  "unknown_noreturn_is_not_failure": [],
+  "unmodeled_syscall_number": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [606, 0, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "unrepresentable_range": [],
+  "unsigned_cast_ordering": [],
+  "unsigned_flag": [
+    {
+      "syscall": "openat2",
+      "args": [
+        -100,
+        ".",
+        {
+          "pointee": {
+            "flags": 9223372036854775808,
+            "mode": 0,
+            "resolve": 0
+          }
+        },
+        24
+      ],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "unsupported_control": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [0, 0, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "whole_object_write_invalidates_field_provenance": []
+}

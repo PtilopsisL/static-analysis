@@ -1,4 +1,4 @@
-/* Expected records expressed as branches whose other arm is a known failure. */
+/* Analysis cases expressed as branches whose other arm is a known failure. */
 #define __NR_pidfd_getfd 438
 #define EINVAL 22
 #define KSFT_FAIL 1

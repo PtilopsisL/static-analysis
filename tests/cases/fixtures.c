@@ -1,4 +1,4 @@
-/* Analysis inputs only: these functions must never be linked or executed. */
+/* Analysis cases only: these functions must never be linked or executed. */
 #define __NR_pidfd_open 434
 #define __NR_pidfd_getfd 438
 #define __NR_openat2 437

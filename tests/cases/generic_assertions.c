@@ -1,4 +1,4 @@
-/* Expected records for assertion expansions that use arbitrary temporaries. */
+/* Analysis cases for assertion expansions that use arbitrary temporaries. */
 #define __NR_pidfd_getfd 438
 #define EINVAL 22
 #define errno (*__errno_location())

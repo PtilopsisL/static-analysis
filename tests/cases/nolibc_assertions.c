@@ -1,4 +1,4 @@
-/* Expected records expressed through nolibc-style assertion helpers. */
+/* Analysis cases expressed through nolibc-style assertion helpers. */
 #define __NR_pidfd_getfd 438
 #define EFAULT 14
 #define errno (*__errno_location())

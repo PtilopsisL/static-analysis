@@ -1,4 +1,4 @@
-/* Expected records expressed through the non-harness kselftest API. */
+/* Analysis cases expressed through the non-harness kselftest API. */
 #define __NR_pidfd_getfd 438
 #define EINVAL 22
 #define errno (*__errno_location())

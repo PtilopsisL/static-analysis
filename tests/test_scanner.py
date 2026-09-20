@@ -88,13 +88,13 @@ class EndToEndTests(unittest.TestCase):
             compdb.write_text(json.dumps([
                 {
                     "directory": str(directory),
-                    "file": str(ROOT / "tests/src/fixtures.c"),
-                    "arguments": [CLANG, "-DCOMPDB_PIDFD=23", "-c", str(ROOT / "tests/src/fixtures.c"), "-o", str(directory / "fixtures-a.o")],
+                    "file": str(ROOT / "tests/cases/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=23", "-c", str(ROOT / "tests/cases/fixtures.c"), "-o", str(directory / "fixtures-a.o")],
                 },
                 {
                     "directory": str(directory),
-                    "file": str(ROOT / "tests/src/fixtures.c"),
-                    "arguments": [CLANG, "-DCOMPDB_PIDFD=31", "-c", str(ROOT / "tests/src/fixtures.c"), "-o", str(directory / "fixtures-b.o")],
+                    "file": str(ROOT / "tests/cases/fixtures.c"),
+                    "arguments": [CLANG, "-DCOMPDB_PIDFD=31", "-c", str(ROOT / "tests/cases/fixtures.c"), "-o", str(directory / "fixtures-b.o")],
                 },
                 {
                     "directory": str(directory),

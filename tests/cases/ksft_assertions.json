@@ -1,0 +1,26 @@
+{
+  "ksft_compound_result": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [303, 32, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ksft_equality": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [301, 30, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_ordering": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [302, 31, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-/* Expected records expressed through the BPF selftest assertion style. */
+/* Analysis cases expressed through the BPF selftest assertion style. */
 #define __NR_pidfd_getfd 438
 #define EPROTO 71
 #define errno (*__errno_location())
