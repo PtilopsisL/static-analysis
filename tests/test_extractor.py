@@ -240,6 +240,11 @@ class ExtractionTests(unittest.TestCase):
             },
         )
 
+    def test_short_circuit_eval_site_is_fresh(self):
+        self.assertEqual(
+            self.extract("short_circuit_eval_site_is_fresh")["records"], []
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

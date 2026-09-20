@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -358,6 +359,26 @@ struct Provenance {
   std::vector<ProjectionSubject> projections;
 };
 
+struct EvaluationSite {
+  const Expr *expression = nullptr;
+  const LocationContext *context = nullptr;
+
+  bool operator==(const EvaluationSite &Other) const {
+    return expression == Other.expression && context == Other.context;
+  }
+
+  bool operator<(const EvaluationSite &Other) const {
+    if (expression != Other.expression)
+      return std::less<const Expr *>()(expression, Other.expression);
+    return std::less<const LocationContext *>()(context, Other.context);
+  }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const {
+    ID.AddPointer(expression);
+    ID.AddPointer(context);
+  }
+};
+
 struct AssertionMarker {
   const Expr *site = nullptr;
   const Invocation *call = nullptr;
@@ -672,8 +693,9 @@ static int ErrnoSymbolTag;
 REGISTER_MAP_WITH_PROGRAMSTATE(SymbolOwners, SymbolRef, SymbolOwner)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceBySymbol, SymbolRef,
                                const Provenance *)
-REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByComparison, const BinaryOperator *,
+REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByEvaluationSite, EvaluationSite,
                                const Provenance *)
+REGISTER_MAP_WITH_PROGRAMSTATE(SValByEvaluationSite, EvaluationSite, SVal)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByRegion, const MemRegion *,
                                const Provenance *)
 REGISTER_SET_WITH_PROGRAMSTATE(PendingAssertions, const AssertionMarker *)
@@ -924,6 +946,61 @@ static Provenance provenanceFromSVal(SVal Value, ProgramStateRef State,
   return Result;
 }
 
+static EvaluationSite evaluationSite(const Expr *Expression,
+                                     CheckerContext &C) {
+  return {Expression, C.getLocationContext()};
+}
+
+static std::optional<bool> knownTruth(SVal Value, ProgramStateRef State) {
+  // This only asks Clang whether the current path proves the predicate. It
+  // does not derive a constraint from the expression's AST shape.
+  auto Condition = Value.getAs<DefinedOrUnknownSVal>();
+  if (!Condition)
+    return std::nullopt;
+  auto [TrueState, FalseState] = State->assume(*Condition);
+  if (TrueState && !FalseState)
+    return true;
+  if (FalseState && !TrueState)
+    return false;
+  return std::nullopt;
+}
+
+static std::optional<bool> knownTruth(const Expr *Expression, CheckerContext &C,
+                                      unsigned Depth = 0) {
+  if (!Expression || Depth > 32)
+    return std::nullopt;
+  const Expr *ValueExpression = Expression;
+  Expression = ignoreExpr(Expression);
+  if (!Expression)
+    return std::nullopt;
+
+  if (const auto *Binary = dyn_cast<BinaryOperator>(Expression)) {
+    if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
+      auto LHS = knownTruth(Binary->getLHS(), C, Depth + 1);
+      if (!LHS)
+        return std::nullopt;
+      if (Binary->getOpcode() == BO_LAnd)
+        return *LHS ? knownTruth(Binary->getRHS(), C, Depth + 1)
+                    : std::optional<bool>(false);
+      return *LHS ? std::optional<bool>(true)
+                  : knownTruth(Binary->getRHS(), C, Depth + 1);
+    }
+  }
+
+  if (const auto *Unary = dyn_cast<UnaryOperator>(Expression)) {
+    if (Unary->getOpcode() == UO_LNot) {
+      auto Inner = knownTruth(Unary->getSubExpr(), C, Depth + 1);
+      return Inner ? std::optional<bool>(!*Inner) : std::nullopt;
+    }
+  }
+
+  if (const SVal *Stored = C.getState()->get<SValByEvaluationSite>(
+          evaluationSite(Expression, C)))
+    if (auto Truth = knownTruth(*Stored, C.getState()))
+      return Truth;
+  return knownTruth(currentValue(ValueExpression, C), C.getState());
+}
+
 static void collectDirectProvenance(const Expr *Expression, CheckerContext &C,
                                     Provenance &EventProvenance) {
   if (!Expression)
@@ -945,6 +1022,11 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
 
   collectDirectProvenance(ValueExpression, C, EventProvenance);
 
+  if (const Provenance *const *Stored =
+          C.getState()->get<ProvenanceByEvaluationSite>(
+              evaluationSite(Expression, C)))
+    mergeProvenance(EventProvenance, **Stored);
+
   if (const auto *Ref = dyn_cast<DeclRefExpr>(Expression)) {
     const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
     if (!Variable)
@@ -959,16 +1041,15 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
   }
 
   if (const auto *Binary = dyn_cast<BinaryOperator>(Expression)) {
-    if (Binary->isComparisonOp()) {
-      const Provenance *const *Stored =
-          C.getState()->get<ProvenanceByComparison>(Binary);
-      if (Stored)
-        mergeProvenance(EventProvenance, **Stored);
+    if (Binary->isComparisonOp())
       return;
-    }
     if (Binary->getOpcode() == BO_LAnd || Binary->getOpcode() == BO_LOr) {
       collectProvenance(Binary->getLHS(), C, EventProvenance, Depth + 1);
-      collectProvenance(Binary->getRHS(), C, EventProvenance, Depth + 1);
+      auto LHS = knownTruth(Binary->getLHS(), C);
+      bool RHSEvaluated =
+          LHS && (Binary->getOpcode() == BO_LAnd ? *LHS : !*LHS);
+      if (RHSEvaluated)
+        collectProvenance(Binary->getRHS(), C, EventProvenance, Depth + 1);
       return;
     }
   }
@@ -1217,17 +1298,25 @@ class SyscallScenarioChecker
 
 public:
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &Reaper) const {
+    auto MarkProvenance = [&](const Provenance *Value) {
+      for (const EventOrigin &Origin : Value->origins)
+        Reaper.markLive(Origin.atom);
+      for (const ProjectionSubject &Projection : Value->projections) {
+        Reaper.markLive(Projection.origin.atom);
+        Reaper.markLive(Projection.constrainedSymbol);
+      }
+    };
     for (const auto &Entry : State->get<SymbolOwners>())
       Reaper.markLive(Entry.first);
     for (const auto &Entry : State->get<ProvenanceBySymbol>()) {
       Reaper.markLive(Entry.first);
-      for (const EventOrigin &Origin : Entry.second->origins)
-        Reaper.markLive(Origin.atom);
-      for (const ProjectionSubject &Projection : Entry.second->projections) {
-        Reaper.markLive(Projection.origin.atom);
-        Reaper.markLive(Projection.constrainedSymbol);
-      }
+      MarkProvenance(Entry.second);
     }
+    for (const auto &Entry : State->get<ProvenanceByEvaluationSite>())
+      MarkProvenance(Entry.second);
+    for (const auto &Entry : State->get<SValByEvaluationSite>())
+      if (SymbolRef Symbol = Entry.second.getAsSymbol(true))
+        Reaper.markLive(Symbol);
   }
 
   void checkBind(SVal Location, SVal Value, const Stmt *Statement,
@@ -1340,14 +1429,21 @@ public:
   }
 
   void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
-    if (!Compare->isComparisonOp() || !ActiveCollector)
+    if (!Compare->isComparisonOp())
       return;
     ProgramStateRef State = C.getState();
-    if (State->get<ProvenanceByComparison>(Compare))
-      State = State->remove<ProvenanceByComparison>(Compare);
+    EvaluationSite Site = evaluationSite(Compare, C);
+    State = State->set<SValByEvaluationSite>(Site, C.getSVal(Compare));
+    if (State->get<ProvenanceByEvaluationSite>(Site))
+      State = State->remove<ProvenanceByEvaluationSite>(Site);
     SymbolRef ResultSymbol = C.getSVal(Compare).getAsSymbol(true);
     if (ResultSymbol && State->get<ProvenanceBySymbol>(ResultSymbol))
       State = State->remove<ProvenanceBySymbol>(ResultSymbol);
+    if (!ActiveCollector) {
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
+    }
     Provenance EventProvenance;
     collectProvenance(Compare->getLHS(), C, EventProvenance);
     collectProvenance(Compare->getRHS(), C, EventProvenance);
@@ -1358,7 +1454,7 @@ public:
     }
     const Provenance *Stored =
         ActiveCollector->makeProvenance(std::move(EventProvenance));
-    State = State->set<ProvenanceByComparison>(Compare, Stored);
+    State = State->set<ProvenanceByEvaluationSite>(Site, Stored);
     if (ResultSymbol)
       State = State->set<ProvenanceBySymbol>(ResultSymbol, Stored);
     C.addTransition(State);

@@ -285,3 +285,12 @@ TEST(errno_range_uses_integer_type_limits) {
   getfd(620, 0, 0);
   ksft_test_result(errno != 0, "expected non-zero errno\n");
 }
+
+TEST(short_circuit_eval_site_is_fresh) {
+  for (int i = 0; i < 2; ++i) {
+    long ret = getfd(621 + i, 0, 0);
+    int ok = ret != 0 || ret == 0;
+    if (i == 1)
+      ksft_test_result(ok, "tautology remains independent of prior event\n");
+  }
+}
