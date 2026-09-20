@@ -1,0 +1,141 @@
+{
+  "dependency_from_return_value": [
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [100, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        3,
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_with_failure_guard": [
+    {
+      "syscall": "pidfd_open",
+      "args": [200, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    },
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [200, 0],
+          "result": {"ret": {"op": ">=", "value": 0}}
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        4,
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_chain": [
+    {
+      "setup": [
+        {
+          "bind": "pidfd",
+          "syscall": "pidfd_open",
+          "args": [300, 0]
+        },
+        {
+          "bind": "copied_fd",
+          "syscall": "pidfd_getfd",
+          "args": [
+            {"ref": "pidfd"},
+            5,
+            0
+          ]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "copied_fd"},
+        6,
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_multiple_resources": [
+    {
+      "setup": [
+        {
+          "bind": "first_fd",
+          "syscall": "pidfd_open",
+          "args": [400, 0]
+        },
+        {
+          "bind": "second_fd",
+          "syscall": "pidfd_open",
+          "args": [401, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "first_fd"},
+        {"ref": "second_fd"},
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_with_argument_domain": [
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [500, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        {
+          "domain": [
+            {">": 0, "<=": 8}
+          ]
+        },
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_through_alias": [
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [600, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        7,
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "reassignment_removes_dependency": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [8, 9, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ]
+}
