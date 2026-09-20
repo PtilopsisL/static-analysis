@@ -480,6 +480,7 @@ class Collector {
     std::vector<ScenarioObservation> alternatives;
     bool explicitAssertion = false;
     bool failureSeen = false;
+    bool skipSeen = false;
   };
 
   std::set<std::string> SelectedFunctions;
@@ -925,6 +926,7 @@ public:
                                    Call->syscall,
                                    {},
                                    Marker->explicitAssertion,
+                                   false,
                                    false});
       return &ObservationGroups.back();
     }
@@ -944,13 +946,19 @@ public:
       Group->failureSeen = true;
   }
 
+  void markSkip(const AssertionMarker *Marker) {
+    if (ObservationGroup *Group = groupFor(Marker))
+      Group->skipSeen = true;
+  }
+
   void finalize() {
     if (Finalized)
       return;
     Records.clear();
     std::vector<ScenarioObservation> Scenarios;
     for (ObservationGroup &Group : ObservationGroups) {
-      if ((!Group.explicitAssertion && !Group.failureSeen) ||
+      if (Group.skipSeen ||
+          (!Group.explicitAssertion && !Group.failureSeen) ||
           Group.alternatives.empty())
         continue;
       Scenarios.insert(Scenarios.end(), Group.alternatives.begin(),
@@ -1114,6 +1122,137 @@ static std::optional<ConcreteValue> snapshotValue(SVal Value, QualType Type,
 static bool namedCall(const CallEvent &Call, llvm::StringRef Name) {
   const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
   return ND && ND->getName() == Name;
+}
+
+enum class SemanticCallKind : uint8_t {
+  Unknown,
+  BooleanAssertion,
+  SyscallEqualAssertion,
+  SyscallZeroAssertion,
+  SyscallErrorAssertion,
+  Failure,
+  LtpReporter,
+  LtpErrnoSet,
+  Preserve,
+};
+
+enum class ContextEffect : uint8_t {
+  Default,
+  Preserve,
+};
+
+enum class PathOutcome : uint8_t {
+  Pass,
+  Fail,
+  Broken,
+  Skip,
+  Neutral,
+};
+
+struct CallSemantics {
+  SemanticCallKind kind = SemanticCallKind::Unknown;
+  ContextEffect contextEffect = ContextEffect::Default;
+  struct OperationModel {
+    std::optional<unsigned> numberArgument;
+    unsigned firstArgument = 0;
+    std::string fixedName;
+    bool modelsErrno = true;
+  };
+  std::optional<OperationModel> operation;
+};
+
+class SemanticDispatcher {
+  using Adapter = std::optional<CallSemantics> (*)(llvm::StringRef);
+
+  static CallSemantics action(SemanticCallKind Kind) {
+    return {Kind, ContextEffect::Preserve, std::nullopt};
+  }
+
+  static std::optional<CallSemantics> operationAdapter(llvm::StringRef Name) {
+    if (Name != "syscall")
+      return std::nullopt;
+    CallSemantics Result;
+    Result.contextEffect = ContextEffect::Preserve;
+    Result.operation = CallSemantics::OperationModel{0, 1, {}, true};
+    return Result;
+  }
+
+  static std::optional<CallSemantics> commonAdapter(llvm::StringRef Name) {
+    if (Name == "abort" || Name == "__assert_fail" || Name == "test__fail")
+      return action(SemanticCallKind::Failure);
+    if (Name == "__errno_location" || Name == "fprintf" || Name == "printf" ||
+        Name == "snprintf" || Name == "puts" || Name == "fputs")
+      return action(SemanticCallKind::Preserve);
+    return std::nullopt;
+  }
+
+  static std::optional<CallSemantics> ksftAdapter(llvm::StringRef Name) {
+    if (Name == "ksft_test_result")
+      return action(SemanticCallKind::BooleanAssertion);
+    if (Name == "ksft_exit_fail_msg")
+      return action(SemanticCallKind::Failure);
+    return std::nullopt;
+  }
+
+  static std::optional<CallSemantics> bpfAdapter(llvm::StringRef Name) {
+    if (Name == "bpf_test_failure")
+      return action(SemanticCallKind::Failure);
+    return std::nullopt;
+  }
+
+  static std::optional<CallSemantics> nolibcAdapter(llvm::StringRef Name) {
+    if (Name == "expect_syseq")
+      return action(SemanticCallKind::SyscallEqualAssertion);
+    if (Name == "expect_syszr")
+      return action(SemanticCallKind::SyscallZeroAssertion);
+    if (Name == "expect_syserr")
+      return action(SemanticCallKind::SyscallErrorAssertion);
+    if (Name == "nolibc_test_failure")
+      return action(SemanticCallKind::Failure);
+    return std::nullopt;
+  }
+
+  static std::optional<CallSemantics> ltpAdapter(llvm::StringRef Name) {
+    if (Name == "tst_res_" || Name == "tst_brk_")
+      return action(SemanticCallKind::LtpReporter);
+    if (Name == "tst_errno_in_set")
+      return action(SemanticCallKind::LtpErrnoSet);
+    return std::nullopt;
+  }
+
+public:
+  static CallSemantics classify(const CallEvent &Call) {
+    const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
+    if (!ND)
+      return {};
+    llvm::StringRef Name = ND->getName();
+    const Adapter Adapters[] = {operationAdapter, commonAdapter, ksftAdapter,
+                                bpfAdapter,       nolibcAdapter, ltpAdapter};
+    for (Adapter Match : Adapters)
+      if (auto Result = Match(Name))
+        return std::move(*Result);
+    return {};
+  }
+};
+
+static std::optional<PathOutcome> ltpOutcome(int64_t Flags) {
+  constexpr int64_t ResultMask = 0x3f;
+  switch (Flags & ResultMask) {
+  case 0:
+    return PathOutcome::Pass;
+  case 1:
+    return PathOutcome::Fail;
+  case 2:
+    return PathOutcome::Broken;
+  case 4:
+  case 8:
+  case 16:
+    return PathOutcome::Neutral;
+  case 32:
+    return PathOutcome::Skip;
+  default:
+    return std::nullopt;
+  }
 }
 
 static std::string syscallName(const CallEvent &Call, int64_t Number,
@@ -1774,38 +1913,26 @@ static bool failureMacroAt(SourceLocation Location, CheckerContext &C) {
   return false;
 }
 
-static bool knownFailureCall(const CallExpr *Call) {
-  const FunctionDecl *Callee = Call ? Call->getDirectCallee() : nullptr;
-  if (!Callee)
-    return false;
-  llvm::StringRef Name = Callee->getName();
-  return Name == "abort" || Name == "__assert_fail" ||
-         Name == "ksft_exit_fail_msg" || Name == "bpf_test_failure" ||
-         Name == "nolibc_test_failure" || Name == "test__fail";
-}
-
 static bool knownFailureReturn(const ReturnStmt *Return, CheckerContext &C) {
   return Return && Return->getRetValue() &&
          failureMacroAt(Return->getRetValue()->getExprLoc(), C);
 }
 
-static bool preservesSyscallContext(const CallEvent &Call) {
-  const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
-  if (!ND)
-    return false;
-  llvm::StringRef Name = ND->getName();
-  return Name == "__errno_location" || Name == "fprintf" || Name == "printf" ||
-         Name == "snprintf" || Name == "puts" || Name == "fputs" ||
-         Name == "ksft_test_result" || Name == "expect_syseq" ||
-         Name == "expect_syszr" || Name == "expect_syserr";
-}
-
-static bool modelableSyscall(const CallEvent &Call, CheckerContext &C) {
-  if (!namedCall(Call, "syscall") || Call.getNumArgs() < 1 ||
-      !ActiveCollector ||
+static bool modelableOperation(const CallEvent &Call,
+                               const CallSemantics &Semantics,
+                               CheckerContext &C) {
+  if (!Semantics.operation || !ActiveCollector ||
       !ActiveCollector->wantsFunction(functionName(C.getLocationContext())))
     return false;
-  const llvm::APSInt *Number = Call.getArgSVal(0).getAsInteger();
+  const CallSemantics::OperationModel &Operation = *Semantics.operation;
+  if (Operation.firstArgument > Call.getNumArgs())
+    return false;
+  if (!Operation.numberArgument)
+    return !Operation.fixedName.empty();
+  if (*Operation.numberArgument >= Call.getNumArgs())
+    return false;
+  const llvm::APSInt *Number =
+      Call.getArgSVal(*Operation.numberArgument).getAsInteger();
   return Number && Number->getBitWidth() <= 64;
 }
 
@@ -1881,10 +2008,15 @@ class SyscallScenarioChecker
     return State->assume(Equal, true);
   }
 
-  static bool applyAssertionCall(const CallEvent &Call, CheckerContext &C) {
-    bool SysEq = namedCall(Call, "expect_syseq") && Call.getNumArgs() >= 2;
-    bool SysZero = namedCall(Call, "expect_syszr") && Call.getNumArgs() >= 1;
-    bool SysError = namedCall(Call, "expect_syserr") && Call.getNumArgs() >= 3;
+  static bool applyAssertionCall(const CallEvent &Call,
+                                 const CallSemantics &Semantics,
+                                 CheckerContext &C) {
+    bool SysEq = Semantics.kind == SemanticCallKind::SyscallEqualAssertion &&
+                 Call.getNumArgs() >= 2;
+    bool SysZero = Semantics.kind == SemanticCallKind::SyscallZeroAssertion &&
+                   Call.getNumArgs() >= 1;
+    bool SysError = Semantics.kind == SemanticCallKind::SyscallErrorAssertion &&
+                    Call.getNumArgs() >= 3;
     if (!SysEq && !SysZero && !SysError)
       return false;
 
@@ -1946,6 +2078,94 @@ class SyscallScenarioChecker
       return;
     for (const AssertionMarker *Marker : State->get<ActiveGuards>())
       ActiveCollector->markFailure(Marker);
+  }
+
+  static void markSkippedGuards(ProgramStateRef State) {
+    if (!ActiveCollector)
+      return;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      ActiveCollector->markSkip(Marker);
+  }
+
+  static bool modelLtpReporter(const CallEvent &Call, CheckerContext &C) {
+    if (Call.getNumArgs() < 3)
+      return false;
+    const llvm::APSInt *Flags = Call.getArgSVal(2).getAsInteger();
+    if (!Flags || Flags->getBitWidth() > 64)
+      return false;
+    int64_t Value = Flags->isUnsigned()
+                        ? static_cast<int64_t>(Flags->getZExtValue())
+                        : Flags->getSExtValue();
+    auto Outcome = ltpOutcome(Value);
+    if (!Outcome)
+      return false;
+
+    switch (*Outcome) {
+    case PathOutcome::Fail:
+    case PathOutcome::Broken:
+      markFailureGuards(C.getState());
+      C.addSink();
+      return true;
+    case PathOutcome::Skip:
+      markSkippedGuards(C.getState());
+      C.addSink();
+      return true;
+    case PathOutcome::Pass:
+    case PathOutcome::Neutral:
+      // tst_brk_ terminates the current test process even for non-failure
+      // results. Such a terminal path is not evidence for an assertion.
+      if (namedCall(Call, "tst_brk_"))
+        C.addSink();
+      else
+        C.addTransition(C.getState());
+      return true;
+    }
+    return false;
+  }
+
+  static const Expr *singlePointeeExpression(const Expr *Pointer) {
+    Pointer = ignoreExpr(Pointer);
+    const auto *Address = dyn_cast_or_null<UnaryOperator>(Pointer);
+    return Address && Address->getOpcode() == UO_AddrOf
+               ? Address->getSubExpr()
+               : nullptr;
+  }
+
+  static bool modelLtpErrnoSet(const CallEvent &Call, CheckerContext &C) {
+    if (Call.getNumArgs() < 3 || !Call.getOriginExpr())
+      return false;
+    const llvm::APSInt *Count = Call.getArgSVal(2).getAsInteger();
+    if (!Count || Count->getBitWidth() > 64 || Count->getExtValue() != 1)
+      return false;
+    const Expr *ExpectedExpression =
+        singlePointeeExpression(Call.getArgExpr(1));
+    if (!ExpectedExpression)
+      return false;
+
+    auto Error = currentValue(Call.getArgExpr(0), C)
+                     .getAs<DefinedOrUnknownSVal>();
+    auto Expected = currentValue(ExpectedExpression, C)
+                        .getAs<DefinedOrUnknownSVal>();
+    if (!Error || !Expected)
+      return false;
+    DefinedOrUnknownSVal Equal =
+        C.getSValBuilder().evalEQ(C.getState(), *Error, *Expected);
+    const Expr *Site = Call.getOriginExpr();
+    ProgramStateRef State = C.getState()->BindExpr(
+        Site, C.getLocationContext(), Equal);
+
+    Provenance EventProvenance;
+    collectProvenance(Call.getArgExpr(0), C, EventProvenance);
+    if (ActiveCollector && !EventProvenance.origins.empty()) {
+      const Provenance *Stored =
+          ActiveCollector->makeProvenance(std::move(EventProvenance));
+      State = State->set<ProvenanceByEvaluationSite>(evaluationSite(Site, C),
+                                                     Stored);
+      if (SymbolRef Symbol = Equal.getAsSymbol(true))
+        State = State->set<ProvenanceBySymbol>(Symbol, Stored);
+    }
+    C.addTransition(State);
+    return true;
   }
 
   static std::optional<ConstraintDomains>
@@ -2090,25 +2310,34 @@ public:
   }
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
-    if (knownFailureCall(
-            dyn_cast_or_null<CallExpr>(ignoreExpr(Call.getOriginExpr())))) {
+    CallSemantics Semantics = SemanticDispatcher::classify(Call);
+    if (Semantics.kind == SemanticCallKind::Failure) {
       markFailureGuards(C.getState());
       C.addSink();
       return true;
     }
-    if (!modelableSyscall(Call, C))
+    if (Semantics.kind == SemanticCallKind::LtpReporter)
+      return modelLtpReporter(Call, C);
+    if (Semantics.kind == SemanticCallKind::LtpErrnoSet)
+      return modelLtpErrnoSet(Call, C);
+    if (!modelableOperation(Call, Semantics, C))
       return false;
     llvm::StringRef Function = functionName(C.getLocationContext());
-
-    const llvm::APSInt *NumberValue = Call.getArgSVal(0).getAsInteger();
-    if (!NumberValue || NumberValue->getBitWidth() > 64)
-      return false;
-    int64_t Number = NumberValue->getSExtValue();
+    const CallSemantics::OperationModel &Operation = *Semantics.operation;
     Invocation Value;
     Value.function = Function.str();
-    Value.syscall = syscallName(Call, Number, C);
+    if (Operation.numberArgument) {
+      const llvm::APSInt *NumberValue =
+          Call.getArgSVal(*Operation.numberArgument).getAsInteger();
+      if (!NumberValue || NumberValue->getBitWidth() > 64)
+        return false;
+      Value.syscall =
+          syscallName(Call, NumberValue->getSExtValue(), C);
+    } else {
+      Value.syscall = Operation.fixedName;
+    }
     Value.eventSite = Call.getOriginExpr();
-    for (unsigned I = 1; I < Call.getNumArgs(); ++I) {
+    for (unsigned I = Operation.firstArgument; I < Call.getNumArgs(); ++I) {
       SVal ArgumentValue = Call.getArgSVal(I);
       QualType ArgumentType = Call.getArgExpr(I)->getType();
       const auto *ArgumentRef =
@@ -2139,11 +2368,13 @@ public:
     }
     SVal Return = C.getSValBuilder().conjureSymbolVal(
         Call, Call.getResultType(), C.blockCount(), this);
-    SVal Error = C.getSValBuilder().conjureSymbolVal(
-        Call, C.getASTContext().IntTy, C.blockCount(), &ErrnoSymbolTag);
     Value.resultSymbol = Return.getAsSymbol();
-    Value.errnoSymbol = Error.getAsSymbol();
-    if (!Value.resultSymbol || !Value.errnoSymbol)
+    if (Operation.modelsErrno) {
+      SVal Error = C.getSValBuilder().conjureSymbolVal(
+          Call, C.getASTContext().IntTy, C.blockCount(), &ErrnoSymbolTag);
+      Value.errnoSymbol = Error.getAsSymbol();
+    }
+    if (!Value.resultSymbol || (Operation.modelsErrno && !Value.errnoSymbol))
       return false;
     const Invocation *Stored =
         ActiveCollector->makeInvocation(std::move(Value));
@@ -2151,8 +2382,9 @@ public:
         Call.getOriginExpr(), C.getLocationContext(), Return);
     State = State->set<SymbolOwners>(Stored->resultSymbol,
                                      SymbolOwner{Stored, EventField::Result});
-    State = State->set<SymbolOwners>(Stored->errnoSymbol,
-                                     SymbolOwner{Stored, EventField::Errno});
+    if (Stored->errnoSymbol)
+      State = State->set<SymbolOwners>(Stored->errnoSymbol,
+                                       SymbolOwner{Stored, EventField::Errno});
     for (const CapturedArgument &Argument : Stored->args) {
       if (Argument.kind != CapturedArgument::Symbolic)
         continue;
@@ -2161,7 +2393,8 @@ public:
       for (SymbolRef Atom : Argument.atoms)
         State = State->add<TrackedArgumentSymbols>(Atom);
     }
-    State = State->set<CurrentErrnoOwner>(Stored);
+    if (Stored->errnoSymbol)
+      State = State->set<CurrentErrnoOwner>(Stored);
     C.addTransition(State);
     return true;
   }
@@ -2174,21 +2407,23 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
-    if (namedCall(Call, "ksft_test_result") && Call.getNumArgs() > 0) {
+    CallSemantics Semantics = SemanticDispatcher::classify(Call);
+    if (Semantics.kind == SemanticCallKind::BooleanAssertion &&
+        Call.getNumArgs() > 0) {
       if (const Expr *Condition = Call.getArgExpr(0))
         applyAssertion(Condition, true, C);
       return;
     }
-    if (applyAssertionCall(Call, C))
+    if (applyAssertionCall(Call, Semantics, C))
       return;
-    if (namedCall(Call, "syscall")) {
-      if (modelableSyscall(Call, C))
+    if (Semantics.operation) {
+      if (modelableOperation(Call, Semantics, C))
         return;
       if (C.getState()->get<CurrentErrnoOwner>())
         C.addTransition(C.getState()->remove<CurrentErrnoOwner>());
       return;
     }
-    if (preservesSyscallContext(Call))
+    if (Semantics.contextEffect == ContextEffect::Preserve)
       return;
     if (!C.getState()->get<CurrentErrnoOwner>())
       return;

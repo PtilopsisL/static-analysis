@@ -126,7 +126,8 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 
 - 直接或经可内联 wrapper 调用的 libc `syscall`；
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
-- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并为 `ksft_test_result` 和 nolibc 风格 syscall assertion helper 提供薄语义适配；不依赖 `__exp` / `__seen` 之类临时变量名；
+- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并通过统一的 call-semantics dispatcher 为 ksft、BPF、nolibc 和 LTP 提供薄语义适配；不依赖 `__exp` / `__seen` 之类临时变量名；
+- LTP 风格的 `TEST` / `TST_RET` / `TST_ERR` 传播、`TST_EXP_*` 结果路径和单个具体 errno 的 `tst_errno_in_set`；`TFAIL` / `TBROK` 作为拒绝路径，`TCONF` 只跳过路径而不形成 oracle，`TPASS` / `TINFO` 等不会被误判为失败；
 - syscall 返回值以及紧随其后的 `errno` 约束；
 - 指向具体结构体和字符串的 syscall 参数快照。
 
