@@ -1,0 +1,96 @@
+{
+  "probe_direct_close": {
+    "events": [{"syscall": "close", "args": [-1], "raw_result": -9}],
+    "returns": [{"ret": -1, "errno": 9}],
+    "records": [{"syscall": "close", "args": [-1], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}}]
+  },
+  "probe_close_success": {
+    "events": [{"syscall": "close", "args": [9], "raw_result": 0}],
+    "returns": [{"ret": 0, "errno": 123}],
+    "records": [{"syscall": "close", "args": [9], "result": {"ret": {"op": "==", "value": 0}}}]
+  },
+  "probe_close_failure": {
+    "events": [{"syscall": "close", "args": [-1], "raw_result": -9}],
+    "returns": [{"ret": -1, "errno": 9}],
+    "records": [{"syscall": "close", "args": [-1], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}}]
+  },
+  "probe_eventfd": {
+    "events": [{"syscall": "eventfd2", "args": [3, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "eventfd2", "args": [3, 0], "result": {"ret": {"op": ">=", "value": 0}}}]
+  },
+  "probe_open_nomode": {
+    "events": [{"syscall": "openat", "args": [-100, "input", 0, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "openat", "args": [-100, "input", 0, 0], "result": {"ret": {"op": ">=", "value": 0}}}]
+  },
+  "probe_open_create": {
+    "events": [{"syscall": "openat", "args": [-100, "created", 193, 416], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "openat", "args": [-100, "created", 193, 416], "result": {"ret": {"op": ">=", "value": 0}}}]
+  },
+  "probe_open_ignored_mode": {
+    "events": [{"syscall": "openat", "args": [-100, "input", 0, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "openat", "args": [-100, "input", 0, 0], "result": {"ret": {"op": ">=", "value": 0}}}]
+  },
+  "probe_open_missing": {
+    "events": [{"syscall": "openat", "args": [-100, "missing", 0, 0], "raw_result": -2}],
+    "returns": [{"ret": -1, "errno": 2}],
+    "records": [{"syscall": "openat", "args": [-100, "missing", 0, 0], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 2}}}]
+  },
+  "probe_openat_nomode": {
+    "events": [{"syscall": "openat", "args": [9, "input", 0, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "openat", "args": [9, "input", 0, 0], "result": {"ret": {"op": ">=", "value": 0}}}]
+  },
+  "probe_open_close": {
+    "events": [
+      {"syscall": "openat", "args": [-100, "input", 0, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"},
+      {"syscall": "close", "args": [{"ref": "fd"}], "raw_result": 0}
+    ],
+    "returns": [{"ret": {"ref": "fd"}, "errno": 123}, {"ret": 0, "errno": 123}],
+    "records": [{"setup": [{"bind": "fd", "syscall": "openat", "args": [-100, "input", 0, 0], "result": {"ret": {"op": ">=", "value": 0}}}], "syscall": "close", "args": [{"ref": "fd"}], "result": {"ret": {"op": "==", "value": 0}}}]
+  },
+  "probe_direct_ioctl": {
+    "events": [{"syscall": "ioctl", "args": [9, 21531, {"before": 0, "after": 3}], "raw_result": 0}],
+    "returns": [{"ret": 0, "errno": 123}],
+    "records": [{"syscall": "ioctl", "args": [9, 21531, {"pointee": 0}], "result": {"ret": {"op": "==", "value": 0}}}]
+  },
+  "probe_ioctl": {
+    "events": [{"syscall": "ioctl", "args": [9, 21531, {"before": 0, "after": 3}], "raw_result": 0}],
+    "returns": [{"ret": 0, "errno": 123}],
+    "records": [{"syscall": "ioctl", "args": [9, 21531, {"pointee": 0}], "result": {"ret": {"op": "==", "value": 0}}}]
+  },
+  "probe_ioctl_followup": {
+    "events": [
+      {"syscall": "ioctl", "args": [9, 21531, {"before": 0, "after": 3}], "raw_result": 0},
+      {"syscall": "eventfd2", "args": [3, 0], "raw_result": {"op": ">=", "value": 0}, "bind": "fd"}
+    ],
+    "returns": [{"ret": 0, "errno": 123}, {"ret": {"ref": "fd"}, "errno": 123}],
+    "records": [{"syscall": "ioctl", "args": [9, 21531, {"pointee": 0}], "result": {"ret": {"op": "==", "value": 0}}}]
+  },
+  "probe_no_syscall": {
+    "events": [],
+    "returns": [{"ret": 42, "errno": 123}],
+    "records": []
+  },
+  "probe_write_buffer": {
+    "events": [{"syscall": "write", "args": [9, {"before": {"hex": "616263"}}, 3], "raw_result": 3}],
+    "returns": [{"ret": 3, "errno": 123}],
+    "records": [{"syscall": "write", "args": [9, "abc", 3], "result": {"ret": {"op": "==", "value": 3}}}]
+  },
+  "probe_close_three": {
+    "events": [
+      {"syscall": "close", "args": [9], "raw_result": 0},
+      {"syscall": "close", "args": [9], "raw_result": -9},
+      {"syscall": "close", "args": [-1], "raw_result": -9}
+    ],
+    "returns": [{"ret": 0, "errno": 123}, {"ret": -1, "errno": 9}, {"ret": -1, "errno": 9}],
+    "records": [
+      {"syscall": "close", "args": [9], "result": {"ret": {"op": "==", "value": 0}}},
+      {"syscall": "close", "args": [9], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}},
+      {"syscall": "close", "args": [-1], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}}
+    ]
+  }
+}
