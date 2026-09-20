@@ -1,7 +1,8 @@
-// Extract concrete syscall expectations by analyzing original source with the
-// exact command recorded in compile_commands.json. The analyzed program is
-// never linked or executed.
+// Extract syscall scenarios by analyzing original source with the exact
+// command recorded in compile_commands.json. The analyzed program is never
+// linked or executed.
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -267,10 +268,14 @@ projectDomain(const std::optional<IntegerDomain> &Stored) {
   return {ProjectionKind::Unrepresentable, std::nullopt};
 }
 
-static std::optional<int64_t> signedDomainValue(const llvm::APSInt &Value) {
-  if (Value.getBitWidth() > 64 || Value.isUnsigned())
+static std::optional<int64_t> integerDomainValue(const llvm::APSInt &Value) {
+  if (Value.getBitWidth() > 64 ||
+      (Value.isUnsigned() &&
+       Value.getZExtValue() >
+           static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))
     return std::nullopt;
-  return Value.getSExtValue();
+  return Value.isUnsigned() ? static_cast<int64_t>(Value.getZExtValue())
+                            : Value.getSExtValue();
 }
 
 static std::optional<IntegerDomain> domainForRangeSet(const RangeSet &Ranges) {
@@ -280,20 +285,28 @@ static std::optional<IntegerDomain> domainForRangeSet(const RangeSet &Ranges) {
   if (Ranges.isEmpty())
     return Domain;
   APSIntType Type = Ranges.getAPSIntType();
-  if (Type.getBitWidth() > 64 || Type.isUnsigned())
+  if (Type.getBitWidth() > 64)
     return std::nullopt;
-  auto TypeMin = signedDomainValue(Type.getMinValue());
-  auto TypeMax = signedDomainValue(Type.getMaxValue());
-  if (!TypeMin || !TypeMax)
-    return std::nullopt;
+  llvm::APSInt TypeMin = Type.getMinValue();
+  llvm::APSInt TypeMax = Type.getMaxValue();
+  bool FullTypeDomain = false;
+  unsigned RangeCount = 0;
   for (const Range &R : Ranges) {
-    auto Lower = signedDomainValue(R.From());
-    auto Upper = signedDomainValue(R.To());
+    ++RangeCount;
+    FullTypeDomain = R.From() == TypeMin && R.To() == TypeMax;
+    std::optional<int64_t> Lower =
+        R.From() == TypeMin
+            ? std::optional<int64_t>(Type.isUnsigned() ? 0 : Min)
+            : integerDomainValue(R.From());
+    std::optional<int64_t> Upper = R.To() == TypeMax
+                                       ? std::optional<int64_t>(Max)
+                                       : integerDomainValue(R.To());
     if (!Lower || !Upper)
       return std::nullopt;
-    Domain.ranges.push_back(
-        {*Lower == *TypeMin ? Min : *Lower, *Upper == *TypeMax ? Max : *Upper});
+    Domain.ranges.push_back({*Lower, *Upper});
   }
+  if (RangeCount == 1 && FullTypeDomain)
+    return fullDomain();
   normalizeDomain(Domain);
   return Domain;
 }
@@ -308,14 +321,49 @@ struct ConstraintSet {
   std::optional<ResultConstraint> error;
 };
 
+struct CapturedArgument {
+  enum Kind { Concrete, Symbolic, Reference, Unsupported } kind = Unsupported;
+  ConcreteValue concrete;
+  SymbolRef symbol = nullptr;
+  std::vector<SymbolRef> atoms;
+  const struct Invocation *producer = nullptr;
+  const ValueDecl *sourceDecl = nullptr;
+
+  static CapturedArgument concreteValue(ConcreteValue Value,
+                                        const ValueDecl *SourceDecl) {
+    CapturedArgument Result;
+    Result.kind = Concrete;
+    Result.concrete = std::move(Value);
+    Result.sourceDecl = SourceDecl;
+    return Result;
+  }
+
+  static CapturedArgument symbolicValue(SymbolRef Symbol,
+                                        std::vector<SymbolRef> Atoms,
+                                        const ValueDecl *SourceDecl) {
+    CapturedArgument Result;
+    Result.kind = Symbolic;
+    Result.symbol = Symbol;
+    Result.atoms = std::move(Atoms);
+    Result.sourceDecl = SourceDecl;
+    return Result;
+  }
+
+  static CapturedArgument reference(const struct Invocation *Producer) {
+    CapturedArgument Result;
+    Result.kind = Reference;
+    Result.producer = Producer;
+    return Result;
+  }
+};
+
 struct Invocation {
   std::string function;
   std::string syscall;
-  std::vector<ConcreteValue> args;
+  std::vector<CapturedArgument> args;
   const Expr *eventSite = nullptr;
   SymbolRef resultSymbol = nullptr;
   SymbolRef errnoSymbol = nullptr;
-  bool concrete = false;
 };
 
 enum class EventField : uint8_t {
@@ -386,6 +434,35 @@ struct AssertionMarker {
   bool explicitAssertion = false;
 };
 
+struct ComparisonHint {
+  SymbolRef subject = nullptr;
+  const ValueDecl *subjectDecl = nullptr;
+  ResultConstraint spelling;
+  SVal predicate;
+};
+
+struct MaterializedArgument {
+  enum Kind { Concrete, Domain, Reference } kind = Concrete;
+  ConcreteValue concrete;
+  IntegerDomain domain;
+  std::vector<ResultConstraint> hints;
+  std::string reference;
+};
+
+struct MaterializedCall {
+  std::string syscall;
+  std::vector<MaterializedArgument> args;
+  std::string bind;
+  ConstraintSet result;
+};
+
+struct ScenarioObservation {
+  std::string function;
+  std::vector<MaterializedCall> setup;
+  MaterializedCall target;
+  ConstraintDomains result;
+};
+
 class Collector {
   struct EmittedRecord {
     std::string function;
@@ -396,11 +473,11 @@ class Collector {
   };
 
   struct ObservationGroup {
-    const Expr *assertionSite;
-    const Expr *eventSite;
-    const Invocation *call;
-    std::string baseKey;
-    std::vector<ConstraintDomains> alternatives;
+    const Expr *assertionSite = nullptr;
+    const Expr *eventSite = nullptr;
+    std::string function;
+    std::string syscall;
+    std::vector<ScenarioObservation> alternatives;
     bool explicitAssertion = false;
     bool failureSeen = false;
   };
@@ -410,6 +487,8 @@ class Collector {
   std::vector<std::unique_ptr<Invocation>> Invocations;
   std::vector<std::unique_ptr<Provenance>> Provenances;
   std::vector<std::unique_ptr<AssertionMarker>> AssertionMarkers;
+  std::vector<std::unique_ptr<ComparisonHint>> ComparisonHints;
+  std::map<const Invocation *, std::string> PreferredBindings;
   std::set<std::string> SeenFunctions;
   std::vector<ObservationGroup> ObservationGroups;
   std::vector<EmittedRecord> Records;
@@ -426,6 +505,10 @@ class Collector {
     return !LHS || (LHS->op == RHS->op && LHS->value == RHS->value);
   }
 
+  static bool equal(const ConstraintSet &LHS, const ConstraintSet &RHS) {
+    return equal(LHS.ret, RHS.ret) && equal(LHS.error, RHS.error);
+  }
+
   static bool subset(const ConstraintSet &LHS, const ConstraintSet &RHS) {
     return (!LHS.ret || equal(LHS.ret, RHS.ret)) &&
            (!LHS.error || equal(LHS.error, RHS.error));
@@ -437,14 +520,6 @@ class Collector {
     OS << Value;
     OS.flush();
     return Text;
-  }
-
-  static std::string baseKey(const Invocation &Call) {
-    json::Array Args;
-    for (const ConcreteValue &Arg : Call.args)
-      Args.push_back(toJSON(Arg));
-    return render(
-        json::Object{{"syscall", Call.syscall}, {"args", std::move(Args)}});
   }
 
   static IntegerDomain
@@ -486,41 +561,256 @@ class Collector {
     }
   }
 
-  static void mergeAlternatives(std::vector<ConstraintDomains> &Alternatives) {
-    for (ConstraintDomains &Domains : Alternatives)
-      canonicalize(Domains);
-    bool Changed;
-    do {
-      Changed = false;
-      for (size_t I = 0; I < Alternatives.size() && !Changed; ++I) {
-        for (size_t J = I + 1; J < Alternatives.size(); ++J) {
-          ConstraintDomains Merged;
-          if (equalDomainFields(Alternatives[I].error, Alternatives[J].error) &&
-              mergeDomainFields(Alternatives[I].ret, Alternatives[J].ret,
-                                Merged.ret)) {
-            Merged.error = Alternatives[I].error;
-          } else if (equalDomainFields(Alternatives[I].ret,
-                                       Alternatives[J].ret) &&
-                     mergeDomainFields(Alternatives[I].error,
-                                       Alternatives[J].error, Merged.error)) {
-            Merged.ret = Alternatives[I].ret;
-          } else {
-            continue;
-          }
-          canonicalize(Merged);
-          Alternatives[I] = std::move(Merged);
-          Alternatives.erase(Alternatives.begin() + J);
-          Changed = true;
-          break;
-        }
-      }
-    } while (Changed);
+  static bool concreteEqual(const ConcreteValue &LHS,
+                            const ConcreteValue &RHS) {
+    return render(toJSON(LHS)) == render(toJSON(RHS));
   }
 
-  void appendRecord(const Invocation *Call, const std::string &BaseKey,
-                    const ConstraintDomains &Domains) {
-    DomainProjection Ret = projectDomain(Domains.ret);
-    DomainProjection Error = projectDomain(Domains.error);
+  static std::optional<IntegerDomain>
+  numericDomain(const MaterializedArgument &Argument) {
+    if (Argument.kind == MaterializedArgument::Domain)
+      return Argument.domain;
+    if (Argument.kind != MaterializedArgument::Concrete ||
+        Argument.concrete.kind != ConcreteValue::Integer)
+      return std::nullopt;
+    if (Argument.concrete.isUnsigned &&
+        Argument.concrete.bits >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return std::nullopt;
+    int64_t Value = static_cast<int64_t>(Argument.concrete.bits);
+    return IntegerDomain{{{Value, Value}}};
+  }
+
+  static void appendHint(std::vector<ResultConstraint> &Hints,
+                         const ResultConstraint &Hint) {
+    if (std::none_of(Hints.begin(), Hints.end(), [&](const auto &Existing) {
+          return Existing.op == Hint.op && Existing.value == Hint.value;
+        }))
+      Hints.push_back(Hint);
+  }
+
+  static void mergeHints(MaterializedArgument &Destination,
+                         const MaterializedArgument &Source) {
+    for (const ResultConstraint &Hint : Source.hints)
+      appendHint(Destination.hints, Hint);
+  }
+
+  static bool argumentEqual(const MaterializedArgument &LHS,
+                            const MaterializedArgument &RHS) {
+    if (LHS.kind == MaterializedArgument::Reference ||
+        RHS.kind == MaterializedArgument::Reference)
+      return LHS.kind == MaterializedArgument::Reference &&
+             RHS.kind == MaterializedArgument::Reference &&
+             LHS.reference == RHS.reference;
+    auto LeftDomain = numericDomain(LHS);
+    auto RightDomain = numericDomain(RHS);
+    if (LeftDomain && RightDomain)
+      return equalDomains(std::move(*LeftDomain), std::move(*RightDomain));
+    return LHS.kind == MaterializedArgument::Concrete &&
+           RHS.kind == MaterializedArgument::Concrete &&
+           concreteEqual(LHS.concrete, RHS.concrete);
+  }
+
+  static bool mergeArgument(MaterializedArgument &Destination,
+                            const MaterializedArgument &Source) {
+    auto LeftDomain = numericDomain(Destination);
+    auto RightDomain = numericDomain(Source);
+    if (!LeftDomain || !RightDomain)
+      return false;
+    Destination.kind = MaterializedArgument::Domain;
+    Destination.domain =
+        unionDomains(std::move(*LeftDomain), std::move(*RightDomain));
+    mergeHints(Destination, Source);
+    return true;
+  }
+
+  static bool callsHaveSameShape(const MaterializedCall &LHS,
+                                 const MaterializedCall &RHS) {
+    return LHS.syscall == RHS.syscall && LHS.bind == RHS.bind &&
+           equal(LHS.result, RHS.result) && LHS.args.size() == RHS.args.size();
+  }
+
+  static bool tryMerge(ScenarioObservation &Destination,
+                       const ScenarioObservation &Source) {
+    if (Destination.function != Source.function ||
+        Destination.setup.size() != Source.setup.size() ||
+        !callsHaveSameShape(Destination.target, Source.target))
+      return false;
+    for (size_t I = 0; I < Destination.setup.size(); ++I)
+      if (!callsHaveSameShape(Destination.setup[I], Source.setup[I]))
+        return false;
+
+    for (size_t I = 0; I < Destination.setup.size(); ++I) {
+      for (size_t J = 0; J < Destination.setup[I].args.size(); ++J) {
+        MaterializedArgument &Left = Destination.setup[I].args[J];
+        const MaterializedArgument &Right = Source.setup[I].args[J];
+        if (!argumentEqual(Left, Right))
+          return false;
+        mergeHints(Left, Right);
+      }
+    }
+
+    MaterializedArgument *Differing = nullptr;
+    const MaterializedArgument *Other = nullptr;
+    unsigned ArgumentDifferences = 0;
+    auto CompareArguments = [&](MaterializedCall &Left,
+                                const MaterializedCall &Right) {
+      for (size_t I = 0; I < Left.args.size(); ++I) {
+        if (argumentEqual(Left.args[I], Right.args[I])) {
+          mergeHints(Left.args[I], Right.args[I]);
+          continue;
+        }
+        ++ArgumentDifferences;
+        Differing = &Left.args[I];
+        Other = &Right.args[I];
+      }
+    };
+    CompareArguments(Destination.target, Source.target);
+    if (ArgumentDifferences > 1)
+      return false;
+
+    bool SameRet = equalDomainFields(Destination.result.ret, Source.result.ret);
+    bool SameError =
+        equalDomainFields(Destination.result.error, Source.result.error);
+    unsigned ResultDifferences =
+        static_cast<unsigned>(!SameRet) + static_cast<unsigned>(!SameError);
+
+    if (ArgumentDifferences == 0 && ResultDifferences == 0)
+      return true;
+    if (ArgumentDifferences == 1 && ResultDifferences == 0)
+      return mergeArgument(*Differing, *Other);
+    if (ArgumentDifferences != 0 || ResultDifferences != 1)
+      return false;
+
+    std::optional<IntegerDomain> Merged;
+    if (!SameRet) {
+      if (!mergeDomainFields(Destination.result.ret, Source.result.ret, Merged))
+        return false;
+      Destination.result.ret = std::move(Merged);
+    } else {
+      if (!mergeDomainFields(Destination.result.error, Source.result.error,
+                             Merged))
+        return false;
+      Destination.result.error = std::move(Merged);
+    }
+    canonicalize(Destination.result);
+    return true;
+  }
+
+  static const ResultConstraint *findHint(
+      const std::vector<ResultConstraint> &Hints,
+      std::initializer_list<std::pair<llvm::StringRef, int64_t>> Candidates) {
+    for (const auto &[Op, Value] : Candidates)
+      for (const ResultConstraint &Hint : Hints)
+        if (Hint.op == Op && Hint.value == Value)
+          return &Hint;
+    return nullptr;
+  }
+
+  static json::Object rangeJSON(const IntegerRange &Range,
+                                const std::vector<ResultConstraint> &Hints) {
+    constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+    constexpr int64_t Max = std::numeric_limits<int64_t>::max();
+    json::Object Object;
+    if (Range.lower != Min) {
+      const ResultConstraint *Hint = nullptr;
+      if (Range.lower != Min)
+        Hint = findHint(Hints, {{">=", Range.lower}, {">", Range.lower - 1}});
+      if (Hint)
+        Object[Hint->op] = Hint->value;
+      else
+        Object[">="] = Range.lower;
+    }
+    if (Range.upper != Max) {
+      const ResultConstraint *Hint =
+          findHint(Hints, {{"<=", Range.upper}, {"<", Range.upper + 1}});
+      if (Hint)
+        Object[Hint->op] = Hint->value;
+      else
+        Object["<"] = Range.upper + 1;
+    }
+    return Object;
+  }
+
+  static json::Value argumentJSON(const MaterializedArgument &Argument) {
+    if (Argument.kind == MaterializedArgument::Concrete)
+      return toJSON(Argument.concrete);
+    if (Argument.kind == MaterializedArgument::Reference)
+      return json::Object{{"ref", Argument.reference}};
+
+    IntegerDomain Domain = Argument.domain;
+    normalizeDomain(Domain);
+    if (Domain.ranges.size() == 1 &&
+        Domain.ranges.front().lower == Domain.ranges.front().upper)
+      return Domain.ranges.front().lower;
+
+    json::Array Entries;
+    constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+    constexpr int64_t Max = std::numeric_limits<int64_t>::max();
+    if (Domain.ranges.size() == 2 && Domain.ranges[0].lower == Min &&
+        Domain.ranges[1].upper == Max && Domain.ranges[0].upper != Max &&
+        Domain.ranges[1].lower != Min &&
+        static_cast<__int128>(Domain.ranges[0].upper) + 2 ==
+            Domain.ranges[1].lower) {
+      Entries.push_back(json::Object{{"!=", Domain.ranges[0].upper + 1}});
+      return json::Object{{"domain", std::move(Entries)}};
+    }
+    for (const IntegerRange &Range : Domain.ranges) {
+      bool ExplicitValues = false;
+      if (Range.lower != Min && Range.upper != Max) {
+        __int128 Count = static_cast<__int128>(Range.upper) - Range.lower + 1;
+        if (Count > 0 &&
+            Count <= static_cast<__int128>(Argument.hints.size())) {
+          ExplicitValues = true;
+          for (int64_t Value = Range.lower;; ++Value) {
+            if (!findHint(Argument.hints, {{"==", Value}})) {
+              ExplicitValues = false;
+              break;
+            }
+            if (Value == Range.upper)
+              break;
+          }
+        }
+      }
+      if (ExplicitValues) {
+        for (int64_t Value = Range.lower;; ++Value) {
+          Entries.push_back(Value);
+          if (Value == Range.upper)
+            break;
+        }
+      } else if (Range.lower == Range.upper) {
+        Entries.push_back(Range.lower);
+      } else {
+        Entries.push_back(rangeJSON(Range, Argument.hints));
+      }
+    }
+    return json::Object{{"domain", std::move(Entries)}};
+  }
+
+  static json::Object resultJSON(const ConstraintSet &Result) {
+    json::Object Object;
+    if (Result.ret)
+      Object["ret"] = constraintJSON(*Result.ret);
+    if (Result.error)
+      Object["errno"] = constraintJSON(*Result.error);
+    return Object;
+  }
+
+  static json::Object callJSON(const MaterializedCall &Call, bool IncludeBind) {
+    json::Array Args;
+    for (const MaterializedArgument &Argument : Call.args)
+      Args.push_back(argumentJSON(Argument));
+    json::Object Object{{"syscall", Call.syscall}, {"args", std::move(Args)}};
+    if (IncludeBind)
+      Object["bind"] = Call.bind;
+    if (Call.result.ret || Call.result.error)
+      Object["result"] = resultJSON(Call.result);
+    return Object;
+  }
+
+  void appendRecord(const ScenarioObservation &Scenario) {
+    DomainProjection Ret = projectDomain(Scenario.result.ret);
+    DomainProjection Error = projectDomain(Scenario.result.error);
     auto CannotEmit = [](ProjectionKind Kind) {
       return Kind == ProjectionKind::Unsatisfiable ||
              Kind == ProjectionKind::Unrepresentable;
@@ -534,8 +824,19 @@ class Collector {
     if (Result.error && !Result.ret)
       Result.ret = ResultConstraint{"==", -1};
 
+    json::Object Record = callJSON(Scenario.target, false);
+    if (!Scenario.setup.empty()) {
+      json::Array Setup;
+      for (const MaterializedCall &Call : Scenario.setup)
+        Setup.push_back(callJSON(Call, true));
+      Record["setup"] = std::move(Setup);
+    }
+    std::string BaseKey = render(json::Object(Record));
+    Record["result"] = resultJSON(Result);
+    std::string FullKey = render(json::Object(Record));
+
     for (auto It = Records.begin(); It != Records.end();) {
-      if (It->function != Call->function || It->baseKey != BaseKey) {
+      if (It->function != Scenario.function || It->baseKey != BaseKey) {
         ++It;
         continue;
       }
@@ -547,21 +848,9 @@ class Collector {
       }
       ++It;
     }
-
-    json::Array Args;
-    for (const ConcreteValue &Arg : Call->args)
-      Args.push_back(toJSON(Arg));
-    json::Object ResultObject;
-    if (Result.ret)
-      ResultObject["ret"] = constraintJSON(*Result.ret);
-    if (Result.error)
-      ResultObject["errno"] = constraintJSON(*Result.error);
-    json::Object Record{{"syscall", Call->syscall},
-                        {"args", std::move(Args)},
-                        {"result", std::move(ResultObject)}};
-    std::string FullKey = render(json::Object(Record));
-    Records.push_back({Call->function, BaseKey, std::move(FullKey),
-                       std::move(Result), std::move(Record)});
+    Records.push_back({Scenario.function, std::move(BaseKey),
+                       std::move(FullKey), std::move(Result),
+                       std::move(Record)});
   }
 
 public:
@@ -600,26 +889,40 @@ public:
     return AssertionMarkers.back().get();
   }
 
+  const ComparisonHint *makeComparisonHint(ComparisonHint Value) {
+    ComparisonHints.push_back(
+        std::make_unique<ComparisonHint>(std::move(Value)));
+    return ComparisonHints.back().get();
+  }
+
+  void noteBinding(const Invocation *Call, llvm::StringRef Name) {
+    if (Call && !Name.empty() && !PreferredBindings.count(Call))
+      PreferredBindings.emplace(Call, Name.str());
+  }
+
+  std::string preferredBinding(const Invocation *Call) const {
+    auto It = PreferredBindings.find(Call);
+    return It == PreferredBindings.end() ? std::string() : It->second;
+  }
+
   ObservationGroup *groupFor(const AssertionMarker *Marker) {
     const Invocation *Call = Marker ? Marker->call : nullptr;
-    if (!Call || !Call->concrete || !wantsFunction(Call->function) ||
-        !wantsSyscall(Call->syscall))
+    if (!Call || !wantsFunction(Call->function) || !wantsSyscall(Call->syscall))
       return nullptr;
     Finalized = false;
-    std::string Key = baseKey(*Call);
     auto Group =
         std::find_if(ObservationGroups.begin(), ObservationGroups.end(),
                      [&](const ObservationGroup &Candidate) {
                        return Candidate.assertionSite == Marker->site &&
                               Candidate.eventSite == Call->eventSite &&
-                              Candidate.call->function == Call->function &&
-                              Candidate.baseKey == Key;
+                              Candidate.function == Call->function &&
+                              Candidate.syscall == Call->syscall;
                      });
     if (Group == ObservationGroups.end()) {
       ObservationGroups.push_back({Marker->site,
                                    Call->eventSite,
-                                   Call,
-                                   std::move(Key),
+                                   Call->function,
+                                   Call->syscall,
                                    {},
                                    Marker->explicitAssertion,
                                    false});
@@ -629,12 +932,11 @@ public:
     return &*Group;
   }
 
-  void observe(const AssertionMarker *Marker, ConstraintDomains Domains) {
-    ObservationGroup *Group = groupFor(Marker);
-    if (!Group)
-      return;
-    canonicalize(Domains);
-    Group->alternatives.push_back(std::move(Domains));
+  void observe(const AssertionMarker *Marker, ScenarioObservation Scenario) {
+    if (ObservationGroup *Group = groupFor(Marker)) {
+      canonicalize(Scenario.result);
+      Group->alternatives.push_back(std::move(Scenario));
+    }
   }
 
   void markFailure(const AssertionMarker *Marker) {
@@ -646,24 +948,39 @@ public:
     if (Finalized)
       return;
     Records.clear();
+    std::vector<ScenarioObservation> Scenarios;
     for (ObservationGroup &Group : ObservationGroups) {
       if ((!Group.explicitAssertion && !Group.failureSeen) ||
           Group.alternatives.empty())
         continue;
-      std::vector<ConstraintDomains> Alternatives = Group.alternatives;
-      mergeAlternatives(Alternatives);
-      for (const ConstraintDomains &Domains : Alternatives)
-        appendRecord(Group.call, Group.baseKey, Domains);
+      Scenarios.insert(Scenarios.end(), Group.alternatives.begin(),
+                       Group.alternatives.end());
     }
+    bool Changed;
+    do {
+      Changed = false;
+      for (size_t I = 0; I < Scenarios.size() && !Changed; ++I) {
+        for (size_t J = I + 1; J < Scenarios.size(); ++J) {
+          if (!tryMerge(Scenarios[I], Scenarios[J]))
+            continue;
+          Scenarios.erase(Scenarios.begin() + static_cast<std::ptrdiff_t>(J));
+          Changed = true;
+          break;
+        }
+      }
+    } while (Changed);
+    for (const ScenarioObservation &Scenario : Scenarios)
+      appendRecord(Scenario);
     Finalized = true;
   }
 
   json::Array functionJSON() const {
     json::Array Result;
     for (const std::string &Name : SeenFunctions) {
-      unsigned Count = std::count_if(
-          Records.begin(), Records.end(),
-          [&](const EmittedRecord &Record) { return Record.function == Name; });
+      size_t Count = static_cast<size_t>(std::count_if(
+          Records.begin(), Records.end(), [&](const EmittedRecord &Record) {
+            return Record.function == Name;
+          }));
       Result.push_back(
           json::Object{{"function", Name},
                        {"status", Count ? "extracted" : "no_records"},
@@ -696,8 +1013,11 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceBySymbol, SymbolRef,
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByEvaluationSite, EvaluationSite,
                                const Provenance *)
 REGISTER_MAP_WITH_PROGRAMSTATE(SValByEvaluationSite, EvaluationSite, SVal)
+REGISTER_MAP_WITH_PROGRAMSTATE(ComparisonHintByEvaluationSite, EvaluationSite,
+                               const ComparisonHint *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByRegion, const MemRegion *,
                                const Provenance *)
+REGISTER_SET_WITH_PROGRAMSTATE(TrackedArgumentSymbols, SymbolRef)
 REGISTER_SET_WITH_PROGRAMSTATE(PendingAssertions, const AssertionMarker *)
 REGISTER_SET_WITH_PROGRAMSTATE(ActiveGuards, const AssertionMarker *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentErrnoOwner, const Invocation *)
@@ -1101,6 +1421,332 @@ static void collectProvenance(const Expr *Expression, CheckerContext &C,
   }
 }
 
+static bool resourceCastChain(SymbolRef Expression, SymbolRef Atom) {
+  if (Expression == Atom)
+    return true;
+  const auto *Cast = dyn_cast_or_null<SymbolCast>(Expression);
+  return Cast && resourceCastChain(Cast->getOperand(), Atom);
+}
+
+static const Invocation *dependencyProducer(SVal Value, QualType Type,
+                                            ProgramStateRef State,
+                                            ASTContext &Context) {
+  SymbolRef Expression = Value.getAsSymbol(true);
+  if (!Expression)
+    return nullptr;
+  Provenance ValueProvenance = provenanceFromValue(Value, State, Type, Context);
+  const Invocation *Producer = nullptr;
+  bool Found = false;
+  for (const EventOrigin &Origin : ValueProvenance.origins) {
+    if (Origin.field != EventField::Result ||
+        !resourceCastChain(Expression, Origin.atom))
+      return nullptr;
+    if (Found && Producer != Origin.call)
+      return nullptr;
+    Producer = Origin.call;
+    Found = true;
+  }
+  return Found ? Producer : nullptr;
+}
+
+static std::string comparisonOperator(BinaryOperatorKind Opcode) {
+  switch (Opcode) {
+  case BO_LT:
+    return "<";
+  case BO_LE:
+    return "<=";
+  case BO_GT:
+    return ">";
+  case BO_GE:
+    return ">=";
+  case BO_EQ:
+    return "==";
+  case BO_NE:
+    return "!=";
+  default:
+    return {};
+  }
+}
+
+static BinaryOperatorKind reverseComparison(BinaryOperatorKind Opcode) {
+  switch (Opcode) {
+  case BO_LT:
+    return BO_GT;
+  case BO_LE:
+    return BO_GE;
+  case BO_GT:
+    return BO_LT;
+  case BO_GE:
+    return BO_LE;
+  default:
+    return Opcode;
+  }
+}
+
+static std::string negateComparison(llvm::StringRef Opcode) {
+  if (Opcode == "<")
+    return ">=";
+  if (Opcode == "<=")
+    return ">";
+  if (Opcode == ">")
+    return "<=";
+  if (Opcode == ">=")
+    return "<";
+  if (Opcode == "==")
+    return "!=";
+  if (Opcode == "!=")
+    return "==";
+  return {};
+}
+
+static std::optional<int64_t> comparisonConstant(SVal Value) {
+  const llvm::APSInt *Integer = Value.getAsInteger();
+  if (!Integer || Integer->getBitWidth() > 64 ||
+      (Integer->isUnsigned() &&
+       Integer->getZExtValue() >
+           static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))
+    return std::nullopt;
+  return Integer->isUnsigned() ? static_cast<int64_t>(Integer->getZExtValue())
+                               : Integer->getSExtValue();
+}
+
+static std::optional<ComparisonHint>
+comparisonHintFor(const BinaryOperator *Compare, CheckerContext &C) {
+  if (!Compare || !Compare->isComparisonOp())
+    return std::nullopt;
+  SVal Left = currentValue(Compare->getLHS(), C);
+  SVal Right = currentValue(Compare->getRHS(), C);
+  auto LeftConstant = comparisonConstant(Left);
+  auto RightConstant = comparisonConstant(Right);
+  SymbolRef Subject = nullptr;
+  const Expr *SubjectExpression = nullptr;
+  int64_t Constant = 0;
+  BinaryOperatorKind Opcode = Compare->getOpcode();
+  if (RightConstant && !LeftConstant) {
+    Subject = Left.getAsSymbol(true);
+    SubjectExpression = Compare->getLHS();
+    Constant = *RightConstant;
+  } else if (LeftConstant && !RightConstant) {
+    Subject = Right.getAsSymbol(true);
+    SubjectExpression = Compare->getRHS();
+    Constant = *LeftConstant;
+    Opcode = reverseComparison(Opcode);
+  }
+  std::string Spelling = comparisonOperator(Opcode);
+  if (!Subject || Spelling.empty())
+    return std::nullopt;
+  const auto *Ref =
+      dyn_cast_or_null<DeclRefExpr>(ignoreExpr(SubjectExpression));
+  const ValueDecl *SubjectDecl = Ref ? Ref->getDecl() : nullptr;
+  return ComparisonHint{Subject,
+                        SubjectDecl,
+                        {std::move(Spelling), Constant},
+                        C.getSVal(Compare)};
+}
+
+static bool symbolMatches(SymbolRef Subject, const CapturedArgument &Argument) {
+  if (Subject == Argument.symbol)
+    return true;
+  return std::find(Argument.atoms.begin(), Argument.atoms.end(), Subject) !=
+         Argument.atoms.end();
+}
+
+static std::vector<ResultConstraint>
+comparisonHintsFor(const CapturedArgument &Argument, ProgramStateRef State) {
+  std::vector<ResultConstraint> Result;
+  for (const auto &Entry : State->get<ComparisonHintByEvaluationSite>()) {
+    const ComparisonHint *Hint = Entry.second;
+    if (!Hint)
+      continue;
+    auto Truth = knownTruth(Hint->predicate, State);
+    if (!Truth)
+      continue;
+    ResultConstraint Effective = Hint->spelling;
+    if (!*Truth)
+      Effective.op = negateComparison(Effective.op);
+    if (Effective.op.empty())
+      continue;
+    bool Matches =
+        symbolMatches(Hint->subject, Argument) ||
+        (Argument.sourceDecl && Hint->subjectDecl == Argument.sourceDecl);
+    if (!Matches && Argument.kind == CapturedArgument::Concrete &&
+        Argument.concrete.kind == ConcreteValue::Integer &&
+        !Argument.concrete.isUnsigned && Effective.op == "==" &&
+        static_cast<int64_t>(Argument.concrete.bits) == Effective.value)
+      Matches = true;
+    if (!Matches)
+      continue;
+    if (std::none_of(Result.begin(), Result.end(), [&](const auto &Existing) {
+          return Existing.op == Effective.op &&
+                 Existing.value == Effective.value;
+        }))
+      Result.push_back(std::move(Effective));
+  }
+  return Result;
+}
+
+static std::optional<IntegerDomain>
+domainForSymbols(SymbolRef Symbol, llvm::ArrayRef<SymbolRef> Atoms,
+                 ProgramStateRef State) {
+  ConstraintMap Constraints = getConstraintMap(State);
+  IntegerDomain Result = fullDomain();
+  std::set<SymbolRef> Seen;
+  auto Intersect = [&](SymbolRef Candidate) -> bool {
+    if (!Candidate || !Seen.insert(Candidate).second)
+      return true;
+    const RangeSet *Ranges = Constraints.lookup(Candidate);
+    if (!Ranges)
+      return true;
+    auto Domain = domainForRangeSet(*Ranges);
+    if (!Domain)
+      return false;
+    Result = intersectDomains(std::move(Result), std::move(*Domain));
+    return true;
+  };
+  if (!Intersect(Symbol))
+    return std::nullopt;
+  for (SymbolRef Atom : Atoms)
+    if (!Intersect(Atom))
+      return std::nullopt;
+  normalizeDomain(Result);
+  return Result;
+}
+
+static ConstraintSet constraintsForInvocation(const Invocation *Call,
+                                              ProgramStateRef State) {
+  ConstraintSet Result;
+  auto Project = [&](SymbolRef Symbol) -> std::optional<ResultConstraint> {
+    auto Domain = domainForSymbols(Symbol, {}, State);
+    if (!Domain || isFullDomain(*Domain))
+      return std::nullopt;
+    DomainProjection Projection = projectDomain(*Domain);
+    return Projection.kind == ProjectionKind::Exact
+               ? std::move(Projection.constraint)
+               : std::nullopt;
+  };
+  Result.ret = Project(Call->resultSymbol);
+  Result.error = Project(Call->errnoSymbol);
+  if (Result.error && !Result.ret)
+    Result.ret = ResultConstraint{"==", -1};
+  return Result;
+}
+
+static bool collectDependencies(const Invocation *Call,
+                                std::vector<const Invocation *> &Ordered,
+                                std::set<const Invocation *> &Visiting,
+                                std::set<const Invocation *> &Done) {
+  if (!Call)
+    return false;
+  if (Done.count(Call))
+    return true;
+  if (!Visiting.insert(Call).second)
+    return false;
+  for (const CapturedArgument &Argument : Call->args) {
+    if (Argument.kind != CapturedArgument::Reference)
+      continue;
+    if (!collectDependencies(Argument.producer, Ordered, Visiting, Done))
+      return false;
+  }
+  Visiting.erase(Call);
+  Done.insert(Call);
+  Ordered.push_back(Call);
+  return true;
+}
+
+static std::optional<MaterializedArgument>
+materializeArgument(const CapturedArgument &Argument, ProgramStateRef State,
+                    const std::map<const Invocation *, std::string> &Names) {
+  MaterializedArgument Result;
+  if (Argument.kind == CapturedArgument::Concrete) {
+    Result.kind = MaterializedArgument::Concrete;
+    Result.concrete = Argument.concrete;
+    Result.hints = comparisonHintsFor(Argument, State);
+    return Result;
+  }
+  if (Argument.kind == CapturedArgument::Reference) {
+    auto Name = Names.find(Argument.producer);
+    if (Name == Names.end())
+      return std::nullopt;
+    Result.kind = MaterializedArgument::Reference;
+    Result.reference = Name->second;
+    return Result;
+  }
+  if (Argument.kind != CapturedArgument::Symbolic)
+    return std::nullopt;
+  auto Domain = domainForSymbols(Argument.symbol, Argument.atoms, State);
+  if (!Domain || Domain->empty() || isFullDomain(*Domain))
+    return std::nullopt;
+  Result.kind = MaterializedArgument::Domain;
+  Result.domain = std::move(*Domain);
+  Result.hints = comparisonHintsFor(Argument, State);
+  return Result;
+}
+
+static std::optional<MaterializedCall>
+materializeCall(const Invocation *Call, ProgramStateRef State,
+                const std::map<const Invocation *, std::string> &Names,
+                bool Setup) {
+  MaterializedCall Result;
+  Result.syscall = Call->syscall;
+  if (Setup) {
+    auto Name = Names.find(Call);
+    if (Name == Names.end())
+      return std::nullopt;
+    Result.bind = Name->second;
+    Result.result = constraintsForInvocation(Call, State);
+  }
+  for (const CapturedArgument &Argument : Call->args) {
+    auto Materialized = materializeArgument(Argument, State, Names);
+    if (!Materialized)
+      return std::nullopt;
+    Result.args.push_back(std::move(*Materialized));
+  }
+  return Result;
+}
+
+static std::optional<ScenarioObservation>
+materializeScenario(const AssertionMarker *Marker, ConstraintDomains Domains,
+                    ProgramStateRef State) {
+  const Invocation *Target = Marker ? Marker->call : nullptr;
+  if (!Target || !ActiveCollector)
+    return std::nullopt;
+
+  std::vector<const Invocation *> Ordered;
+  std::set<const Invocation *> Visiting;
+  std::set<const Invocation *> Done;
+  if (!collectDependencies(Target, Ordered, Visiting, Done) || Ordered.empty())
+    return std::nullopt;
+  Ordered.pop_back();
+
+  std::map<const Invocation *, std::string> Names;
+  std::set<std::string> UsedNames;
+  unsigned Generated = 0;
+  for (const Invocation *Call : Ordered) {
+    std::string Base = ActiveCollector->preferredBinding(Call);
+    if (Base.empty())
+      Base = "dep" + std::to_string(Generated++);
+    std::string Name = Base;
+    for (unsigned Suffix = 2; !UsedNames.insert(Name).second; ++Suffix)
+      Name = Base + "_" + std::to_string(Suffix);
+    Names.emplace(Call, std::move(Name));
+  }
+
+  ScenarioObservation Result;
+  Result.function = Target->function;
+  Result.result = std::move(Domains);
+  for (const Invocation *Call : Ordered) {
+    auto Setup = materializeCall(Call, State, Names, true);
+    if (!Setup)
+      return std::nullopt;
+    Result.setup.push_back(std::move(*Setup));
+  }
+  auto MaterializedTarget = materializeCall(Target, State, Names, false);
+  if (!MaterializedTarget)
+    return std::nullopt;
+  Result.target = std::move(*MaterializedTarget);
+  return Result;
+}
+
 static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
   const SourceManager &SM = C.getSourceManager();
   for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
@@ -1385,6 +2031,17 @@ public:
     for (const auto &Entry : State->get<SValByEvaluationSite>())
       if (SymbolRef Symbol = Entry.second.getAsSymbol(true))
         Reaper.markLive(Symbol);
+    for (SymbolRef Symbol : State->get<TrackedArgumentSymbols>())
+      Reaper.markLive(Symbol);
+    for (const auto &Entry : State->get<ComparisonHintByEvaluationSite>()) {
+      const ComparisonHint *Hint = Entry.second;
+      if (!Hint)
+        continue;
+      if (Hint->subject)
+        Reaper.markLive(Hint->subject);
+      if (SymbolRef Symbol = Hint->predicate.getAsSymbol(true))
+        Reaper.markLive(Symbol);
+    }
   }
 
   void checkBind(SVal Location, SVal Value, const Stmt *Statement,
@@ -1406,6 +2063,21 @@ public:
           collectProvenance(Source, C, EventProvenance);
       }
       if (!EventProvenance.origins.empty()) {
+        const auto *VariableRegion = dyn_cast<VarRegion>(Region);
+        const Invocation *BoundCall = nullptr;
+        bool Ambiguous = false;
+        for (const EventOrigin &Origin : EventProvenance.origins) {
+          if (Origin.field != EventField::Result)
+            continue;
+          if (BoundCall && BoundCall != Origin.call) {
+            Ambiguous = true;
+            break;
+          }
+          BoundCall = Origin.call;
+        }
+        if (!Ambiguous && BoundCall && VariableRegion)
+          ActiveCollector->noteBinding(BoundCall,
+                                       VariableRegion->getDecl()->getName());
         const Provenance *Binding =
             ActiveCollector->makeProvenance(std::move(EventProvenance));
         State = State->set<ProvenanceByRegion>(Region, Binding);
@@ -1436,16 +2108,34 @@ public:
     Value.function = Function.str();
     Value.syscall = syscallName(Call, Number, C);
     Value.eventSite = Call.getOriginExpr();
-    Value.concrete = true;
     for (unsigned I = 1; I < Call.getNumArgs(); ++I) {
-      auto Arg =
-          snapshotValue(Call.getArgSVal(I), Call.getArgExpr(I)->getType(),
-                        C.getState(), C.getLocationContext());
-      if (!Arg) {
-        Value.concrete = false;
-        break;
+      SVal ArgumentValue = Call.getArgSVal(I);
+      QualType ArgumentType = Call.getArgExpr(I)->getType();
+      const auto *ArgumentRef =
+          dyn_cast_or_null<DeclRefExpr>(ignoreExpr(Call.getArgExpr(I)));
+      const ValueDecl *SourceDecl =
+          ArgumentRef ? ArgumentRef->getDecl() : nullptr;
+      if (const Invocation *Producer = dependencyProducer(
+              ArgumentValue, ArgumentType, C.getState(), C.getASTContext())) {
+        Value.args.push_back(CapturedArgument::reference(Producer));
+        continue;
       }
-      Value.args.push_back(std::move(*Arg));
+      if (auto Concrete = snapshotValue(ArgumentValue, ArgumentType,
+                                        C.getState(), C.getLocationContext())) {
+        Value.args.push_back(
+            CapturedArgument::concreteValue(std::move(*Concrete), SourceDecl));
+        continue;
+      }
+      SymbolRef Symbol = ArgumentValue.getAsSymbol(true);
+      if (Symbol && ArgumentType->isIntegerType()) {
+        std::vector<SymbolRef> Atoms;
+        for (SymbolRef Atom : ArgumentValue.symbols())
+          Atoms.push_back(Atom);
+        Value.args.push_back(CapturedArgument::symbolicValue(
+            Symbol, std::move(Atoms), SourceDecl));
+        continue;
+      }
+      Value.args.emplace_back();
     }
     SVal Return = C.getSValBuilder().conjureSymbolVal(
         Call, Call.getResultType(), C.blockCount(), this);
@@ -1463,6 +2153,14 @@ public:
                                      SymbolOwner{Stored, EventField::Result});
     State = State->set<SymbolOwners>(Stored->errnoSymbol,
                                      SymbolOwner{Stored, EventField::Errno});
+    for (const CapturedArgument &Argument : Stored->args) {
+      if (Argument.kind != CapturedArgument::Symbolic)
+        continue;
+      if (Argument.symbol)
+        State = State->add<TrackedArgumentSymbols>(Argument.symbol);
+      for (SymbolRef Atom : Argument.atoms)
+        State = State->add<TrackedArgumentSymbols>(Atom);
+    }
     State = State->set<CurrentErrnoOwner>(Stored);
     C.addTransition(State);
     return true;
@@ -1503,6 +2201,12 @@ public:
     ProgramStateRef State = C.getState();
     EvaluationSite Site = evaluationSite(Compare, C);
     State = State->set<SValByEvaluationSite>(Site, C.getSVal(Compare));
+    if (State->get<ComparisonHintByEvaluationSite>(Site))
+      State = State->remove<ComparisonHintByEvaluationSite>(Site);
+    if (ActiveCollector)
+      if (auto Hint = comparisonHintFor(Compare, C))
+        State = State->set<ComparisonHintByEvaluationSite>(
+            Site, ActiveCollector->makeComparisonHint(std::move(*Hint)));
     if (State->get<ProvenanceByEvaluationSite>(Site))
       State = State->remove<ProvenanceByEvaluationSite>(Site);
     SymbolRef ResultSymbol = C.getSVal(Compare).getAsSymbol(true);
@@ -1579,13 +2283,16 @@ public:
       return;
     for (const AssertionMarker *Marker :
          C.getState()->get<PendingAssertions>()) {
-      if (auto Domains = domainsForMarker(Marker, C.getState())) {
-        ActiveCollector->observe(Marker, std::move(*Domains));
-      }
+      if (auto Domains = domainsForMarker(Marker, C.getState()))
+        if (auto Scenario =
+                materializeScenario(Marker, std::move(*Domains), C.getState()))
+          ActiveCollector->observe(Marker, std::move(*Scenario));
     }
     for (const AssertionMarker *Marker : C.getState()->get<ActiveGuards>())
       if (auto Domains = domainsForMarker(Marker, C.getState()))
-        ActiveCollector->observe(Marker, std::move(*Domains));
+        if (auto Scenario =
+                materializeScenario(Marker, std::move(*Domains), C.getState()))
+          ActiveCollector->observe(Marker, std::move(*Scenario));
   }
 };
 
@@ -1602,8 +2309,7 @@ protected:
     auto Consumer = CreateAnalysisConsumer(CI);
     Consumer->AddCheckerRegistrationFn([](CheckerRegistry &Registry) {
       Registry.addChecker<SyscallScenarioChecker>(
-          "extractor.SyscallScenario", "Extract concrete syscall expectations",
-          "", false);
+          "extractor.SyscallScenario", "Extract syscall scenarios", "", false);
     });
     return Consumer;
   }

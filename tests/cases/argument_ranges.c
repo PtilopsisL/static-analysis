@@ -3,18 +3,23 @@
 
 extern long syscall(long number, ...);
 extern int unknown_value(void);
+extern unsigned unknown_unsigned(void);
 
 #define TEST(name) static void name(void)
-#define EXPECT_EQ(expected, seen)                                         \
-  do {                                                                    \
-    __typeof__(expected) __expected = (expected);                          \
-    __typeof__(seen) __seen = (seen);                                     \
-    if (!(__expected == __seen)) {                                        \
-    }                                                                     \
+#define EXPECT_EQ(expected, seen)                                              \
+  do {                                                                         \
+    __typeof__(expected) __expected = (expected);                              \
+    __typeof__(seen) __seen = (seen);                                          \
+    if (!(__expected == __seen)) {                                             \
+    }                                                                          \
   } while (0)
 
 static long getfd(int pidfd, int fd, unsigned flags) {
   return syscall(__NR_pidfd_getfd, pidfd, fd, flags);
+}
+
+static long getfd_unsigned(unsigned fd) {
+  return syscall(__NR_pidfd_getfd, 0, fd, 1);
 }
 
 TEST(argument_loop_range) {
@@ -83,4 +88,17 @@ TEST(argument_values_and_range_union) {
   if (pidfd == 1 || pidfd == 2 || pidfd == 4 || pidfd == 8 ||
       (20 < pidfd && pidfd <= 30))
     EXPECT_EQ(getfd(pidfd, 0, 1), -1);
+}
+
+TEST(argument_pairs_preserve_correlation) {
+  int pidfd = unknown_value();
+  int target_fd = unknown_value();
+  if ((pidfd == 1 && target_fd == 2) || (pidfd == 3 && target_fd == 4))
+    EXPECT_EQ(getfd(pidfd, target_fd, 1), -1);
+}
+
+TEST(argument_unsigned_range) {
+  unsigned target_fd = unknown_unsigned();
+  if (target_fd < 10)
+    EXPECT_EQ(getfd_unsigned(target_fd), -1);
 }

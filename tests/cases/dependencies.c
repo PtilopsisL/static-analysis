@@ -6,12 +6,12 @@ extern long syscall(long number, ...);
 extern int unknown_value(void);
 
 #define TEST(name) static void name(void)
-#define EXPECT_EQ(expected, seen)                                         \
-  do {                                                                    \
-    __typeof__(expected) __expected = (expected);                          \
-    __typeof__(seen) __seen = (seen);                                     \
-    if (!(__expected == __seen)) {                                        \
-    }                                                                     \
+#define EXPECT_EQ(expected, seen)                                              \
+  do {                                                                         \
+    __typeof__(expected) __expected = (expected);                              \
+    __typeof__(seen) __seen = (seen);                                          \
+    if (!(__expected == __seen)) {                                             \
+    }                                                                          \
   } while (0)
 
 TEST(dependency_from_return_value) {
@@ -57,4 +57,14 @@ TEST(reassignment_removes_dependency) {
   long fd = syscall(__NR_pidfd_open, 700, 0);
   fd = 8;
   EXPECT_EQ(syscall(__NR_pidfd_getfd, fd, 9, 0), -1);
+}
+
+TEST(dependency_different_setups_stay_separate) {
+  long fd;
+  if (unknown_value())
+    fd = syscall(__NR_pidfd_open, 800, 0);
+  else
+    fd = syscall(__NR_pidfd_open, 801, 0);
+
+  EXPECT_EQ(syscall(__NR_pidfd_getfd, fd, 10, 0), -1);
 }

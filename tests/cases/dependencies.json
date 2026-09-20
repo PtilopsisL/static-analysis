@@ -19,11 +19,6 @@
   ],
   "dependency_with_failure_guard": [
     {
-      "syscall": "pidfd_open",
-      "args": [200, 0],
-      "result": {"ret": {"op": ">=", "value": 0}}
-    },
-    {
       "setup": [
         {
           "bind": "fd",
@@ -135,6 +130,40 @@
     {
       "syscall": "pidfd_getfd",
       "args": [8, 9, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "dependency_different_setups_stay_separate": [
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [800, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        10,
+        0
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    },
+    {
+      "setup": [
+        {
+          "bind": "fd",
+          "syscall": "pidfd_open",
+          "args": [801, 0]
+        }
+      ],
+      "syscall": "pidfd_getfd",
+      "args": [
+        {"ref": "fd"},
+        10,
+        0
+      ],
       "result": {"ret": {"op": "==", "value": -1}}
     }
   ]

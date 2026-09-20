@@ -146,5 +146,32 @@
       ],
       "result": {"ret": {"op": "==", "value": -1}}
     }
+  ],
+  "argument_pairs_preserve_correlation": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [1, 2, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    },
+    {
+      "syscall": "pidfd_getfd",
+      "args": [3, 4, 1],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ],
+  "argument_unsigned_range": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [
+        0,
+        {
+          "domain": [
+            {">=": 0, "<": 10}
+          ]
+        },
+        1
+      ],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
   ]
 }
