@@ -16,11 +16,47 @@
       "result": {"ret": {"op": "==", "value": 0}}
     }
   ],
+  "ksft_exit_condition": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [307, 36, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ksft_exit_skip_is_not_oracle": [],
   "ksft_ordering": [
     {
       "syscall": "pidfd_getfd",
       "args": [302, 31, 0],
       "result": {"ret": {"op": ">=", "value": 0}}
     }
-  ]
+  ],
+  "ksft_reporter_false_branch": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [305, 34, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_reporter_true_branch": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [304, 33, 0],
+      "result": {
+        "ret": {"op": "==", "value": -1},
+        "errno": {"op": "==", "value": 22}
+      }
+    }
+  ],
+  "ksft_result_then_finished": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [306, 35, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_skip_is_not_oracle": []
 }

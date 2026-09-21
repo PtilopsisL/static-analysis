@@ -1136,6 +1136,7 @@ enum class SemanticCallKind : uint8_t {
   SyscallZeroAssertion,
   SyscallErrorAssertion,
   Failure,
+  Skip,
   LtpReporter,
   LtpErrnoSet,
   Preserve,
@@ -1216,8 +1217,14 @@ class SemanticDispatcher {
   static std::optional<CallSemantics> ksftAdapter(llvm::StringRef Name) {
     if (Name == "ksft_test_result")
       return action(SemanticCallKind::BooleanAssertion);
-    if (Name == "ksft_exit_fail_msg")
+    if (Name == "ksft_test_result_fail" ||
+        Name == "ksft_test_result_error" || Name == "ksft_exit_fail" ||
+        Name == "ksft_exit_fail_msg" || Name == "ksft_exit_fail_perror")
       return action(SemanticCallKind::Failure);
+    if (Name == "ksft_test_result_skip" || Name == "ksft_exit_skip")
+      return action(SemanticCallKind::Skip);
+    if (Name == "ksft_test_result_pass")
+      return action(SemanticCallKind::Preserve);
     return std::nullopt;
   }
 
@@ -2082,20 +2089,27 @@ materializeScenario(const AssertionMarker *Marker, ConstraintDomains Domains,
   return Result;
 }
 
-static bool assertionMacroAt(SourceLocation Location, CheckerContext &C) {
+/* Return the truth value of the expanded branch condition on a successful
+ * assertion path.  Harness EXPECT/ASSERT macros branch when their predicate
+ * fails, whereas the non-harness ksft_test_result and ksft_exit macros branch
+ * when their predicate succeeds. */
+static std::optional<bool> assertionExpectedAt(SourceLocation Location,
+                                               CheckerContext &C) {
   const SourceManager &SM = C.getSourceManager();
   for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
     llvm::StringRef Name =
         Lexer::getImmediateMacroName(Location, SM, C.getLangOpts());
     if (Name == "EXPECT_SYSEQ" || Name == "EXPECT_SYSZR" ||
         Name == "EXPECT_SYSER")
-      return false;
+      return std::nullopt;
+    if (Name == "ksft_test_result" || Name == "ksft_exit")
+      return true;
     if (Name == "CHECK_OP" || Name.starts_with("EXPECT_") ||
         Name.starts_with("ASSERT_"))
-      return true;
+      return false;
     Location = SM.getImmediateMacroCallerLoc(Location);
   }
-  return false;
+  return std::nullopt;
 }
 
 static bool failureMacroAt(SourceLocation Location, CheckerContext &C) {
@@ -2519,6 +2533,11 @@ public:
       C.addSink();
       return true;
     }
+    if (Semantics.kind == SemanticCallKind::Skip) {
+      markSkippedGuards(C.getState());
+      C.addSink();
+      return true;
+    }
     if (Semantics.kind == SemanticCallKind::LtpReporter)
       return modelLtpReporter(Call, C);
     if (Semantics.kind == SemanticCallKind::LtpErrnoSet)
@@ -2733,11 +2752,15 @@ public:
     if (!Expression || !Block)
       return;
     if (const auto *If = dyn_cast_or_null<IfStmt>(Block->getTerminatorStmt())) {
-      if (ignoreExpr(Expression) == ignoreExpr(If->getCond()) &&
-          (assertionMacroAt(If->getIfLoc(), C) ||
-           assertionMacroAt(Expression->getExprLoc(), C))) {
-        applyAssertion(Expression, false, C);
-        return;
+      if (ignoreExpr(Expression) == ignoreExpr(If->getCond())) {
+        std::optional<bool> Expected =
+            assertionExpectedAt(If->getIfLoc(), C);
+        if (!Expected)
+          Expected = assertionExpectedAt(Expression->getExprLoc(), C);
+        if (Expected) {
+          applyAssertion(Expression, *Expected, C);
+          return;
+        }
       }
     }
     registerGuard(Expression, C);
