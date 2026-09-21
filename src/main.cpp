@@ -1136,7 +1136,8 @@ enum class SemanticCallKind : uint8_t {
   SyscallZeroAssertion,
   SyscallErrorAssertion,
   Failure,
-  Skip,
+  KsftOutcome,
+  KsftResultCode,
   LtpReporter,
   LtpErrnoSet,
   Preserve,
@@ -1158,6 +1159,8 @@ enum class PathOutcome : uint8_t {
 struct CallSemantics {
   SemanticCallKind kind = SemanticCallKind::Unknown;
   ContextEffect contextEffect = ContextEffect::Default;
+  std::optional<PathOutcome> outcome;
+  bool terminal = false;
   struct OperationModel {
     struct Argument {
       enum Kind : uint8_t { CallArgument, SignedConstant, UnsignedConstant };
@@ -1192,7 +1195,17 @@ class SemanticDispatcher {
   using Adapter = std::optional<CallSemantics> (*)(llvm::StringRef);
 
   static CallSemantics action(SemanticCallKind Kind) {
-    return {Kind, ContextEffect::Preserve, std::nullopt};
+    CallSemantics Result;
+    Result.kind = Kind;
+    Result.contextEffect = ContextEffect::Preserve;
+    return Result;
+  }
+
+  static CallSemantics ksftOutcome(PathOutcome Outcome, bool Terminal) {
+    CallSemantics Result = action(SemanticCallKind::KsftOutcome);
+    Result.outcome = Outcome;
+    Result.terminal = Terminal;
+    return Result;
   }
 
   static std::optional<CallSemantics> operationAdapter(llvm::StringRef Name) {
@@ -1217,14 +1230,27 @@ class SemanticDispatcher {
   static std::optional<CallSemantics> ksftAdapter(llvm::StringRef Name) {
     if (Name == "ksft_test_result")
       return action(SemanticCallKind::BooleanAssertion);
+    if (Name == "ksft_test_result_code")
+      return action(SemanticCallKind::KsftResultCode);
+    if (Name == "ksft_test_result_pass" || Name == "ksft_inc_pass_cnt")
+      return ksftOutcome(PathOutcome::Pass, false);
     if (Name == "ksft_test_result_fail" ||
-        Name == "ksft_test_result_error" || Name == "ksft_exit_fail" ||
-        Name == "ksft_exit_fail_msg" || Name == "ksft_exit_fail_perror")
-      return action(SemanticCallKind::Failure);
-    if (Name == "ksft_test_result_skip" || Name == "ksft_exit_skip")
-      return action(SemanticCallKind::Skip);
-    if (Name == "ksft_test_result_pass")
-      return action(SemanticCallKind::Preserve);
+        Name == "ksft_test_result_error" || Name == "ksft_inc_fail_cnt" ||
+        Name == "ksft_inc_error_cnt")
+      return ksftOutcome(PathOutcome::Fail, false);
+    if (Name == "ksft_test_result_skip" ||
+        Name == "ksft_test_result_xfail" ||
+        Name == "ksft_test_result_xpass" || Name == "ksft_inc_xskip_cnt" ||
+        Name == "ksft_inc_xfail_cnt" || Name == "ksft_inc_xpass_cnt")
+      return ksftOutcome(PathOutcome::Skip, false);
+    if (Name == "ksft_exit_pass")
+      return ksftOutcome(PathOutcome::Pass, true);
+    if (Name == "ksft_exit_fail" || Name == "ksft_exit_fail_msg" ||
+        Name == "ksft_exit_fail_perror")
+      return ksftOutcome(PathOutcome::Fail, true);
+    if (Name == "ksft_exit_skip" || Name == "ksft_exit_xfail" ||
+        Name == "ksft_exit_xpass")
+      return ksftOutcome(PathOutcome::Skip, true);
     return std::nullopt;
   }
 
@@ -2123,6 +2149,16 @@ static bool failureMacroAt(SourceLocation Location, CheckerContext &C) {
   return false;
 }
 
+static bool skipMacroAt(SourceLocation Location, CheckerContext &C) {
+  const SourceManager &SM = C.getSourceManager();
+  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
+    if (Lexer::getImmediateMacroName(Location, SM, C.getLangOpts()) == "SKIP")
+      return true;
+    Location = SM.getImmediateMacroCallerLoc(Location);
+  }
+  return false;
+}
+
 static bool knownFailureReturn(const ReturnStmt *Return, CheckerContext &C) {
   return Return && Return->getRetValue() &&
          failureMacroAt(Return->getRetValue()->getExprLoc(), C);
@@ -2157,6 +2193,7 @@ class SyscallScenarioChecker
     : public Checker<
           eval::Call, check::PreCall, check::Bind, check::LiveSymbols,
           check::RegionChanges, check::PreStmt<ReturnStmt>,
+          check::PreStmt<GotoStmt>,
           check::PostStmt<ImplicitCastExpr>, check::PostStmt<BinaryOperator>,
           check::BeginFunction, check::EndFunction, check::BranchCondition> {
   static const Expr *fallbackBindingSource(const MemRegion *Region,
@@ -2288,6 +2325,69 @@ class SyscallScenarioChecker
     if (!EventProvenance.projections.empty())
       C.addTransition(
           addMarkers(C.getState(), Expression, EventProvenance, false));
+  }
+
+  static void observeMarker(const AssertionMarker *Marker,
+                            ProgramStateRef State) {
+    if (!ActiveCollector)
+      return;
+    if (auto Domains = domainsForMarker(Marker, State))
+      if (auto Scenario =
+              materializeScenario(Marker, std::move(*Domains), State))
+        ActiveCollector->observe(Marker, std::move(*Scenario));
+  }
+
+  /* Reporter calls close the guards accumulated since the previous reporter.
+   * This includes every CFG component of compound conditions such as a && b.
+   * Completed earlier tests have already removed their guards from the state. */
+  static ProgramStateRef completeActiveGuards(ProgramStateRef State,
+                                              PathOutcome Outcome) {
+    ProgramStateRef Result = State;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>()) {
+      switch (Outcome) {
+      case PathOutcome::Pass:
+        observeMarker(Marker, State);
+        break;
+      case PathOutcome::Fail:
+      case PathOutcome::Broken:
+        if (ActiveCollector)
+          ActiveCollector->markFailure(Marker);
+        break;
+      case PathOutcome::Skip:
+        if (ActiveCollector)
+          ActiveCollector->markSkip(Marker);
+        break;
+      case PathOutcome::Neutral:
+        break;
+      }
+      Result = Result->remove<ActiveGuards>(Marker);
+    }
+    return Result;
+  }
+
+  static void observePendingAssertions(ProgramStateRef State) {
+    for (const AssertionMarker *Marker : State->get<PendingAssertions>())
+      observeMarker(Marker, State);
+  }
+
+  static void observeActiveGuards(ProgramStateRef State) {
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      observeMarker(Marker, State);
+  }
+
+  static std::optional<PathOutcome> ksftOutcomeForCode(int64_t Code) {
+    switch (Code) {
+    case 0:
+      return PathOutcome::Pass;
+    case 1:
+      return PathOutcome::Fail;
+    case 2:
+    case 3:
+    case 4:
+      return PathOutcome::Skip;
+    default:
+      return PathOutcome::Fail;
+    }
   }
 
   static void markFailureGuards(ProgramStateRef State) {
@@ -2528,13 +2628,26 @@ public:
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
     CallSemantics Semantics = SemanticDispatcher::classify(Call, C);
-    if (Semantics.kind == SemanticCallKind::Failure) {
-      markFailureGuards(C.getState());
+    if (Semantics.kind == SemanticCallKind::KsftOutcome) {
+      if (!Semantics.outcome || !Semantics.terminal)
+        return false;
+      ProgramStateRef State =
+          completeActiveGuards(C.getState(), *Semantics.outcome);
+      if (*Semantics.outcome == PathOutcome::Pass) {
+        observePendingAssertions(State);
+        observeActiveGuards(State);
+      } else {
+        /* Explicit assertions completed before a terminal failure or skip are
+         * still valid observations from earlier tests. */
+        observePendingAssertions(State);
+      }
       C.addSink();
       return true;
     }
-    if (Semantics.kind == SemanticCallKind::Skip) {
-      markSkippedGuards(C.getState());
+    if (Semantics.kind == SemanticCallKind::KsftResultCode)
+      return false;
+    if (Semantics.kind == SemanticCallKind::Failure) {
+      markFailureGuards(C.getState());
       C.addSink();
       return true;
     }
@@ -2649,10 +2762,26 @@ public:
   }
 
   void checkPreStmt(const ReturnStmt *Return, CheckerContext &C) const {
+    if (Return && skipMacroAt(Return->getReturnLoc(), C)) {
+      ProgramStateRef State =
+          completeActiveGuards(C.getState(), PathOutcome::Skip);
+      observePendingAssertions(State);
+      C.addSink();
+      return;
+    }
     if (knownFailureReturn(Return, C)) {
       markFailureGuards(C.getState());
       C.addSink();
     }
+  }
+
+  void checkPreStmt(const GotoStmt *Goto, CheckerContext &C) const {
+    if (!Goto || !skipMacroAt(Goto->getGotoLoc(), C))
+      return;
+    ProgramStateRef State =
+        completeActiveGuards(C.getState(), PathOutcome::Skip);
+    observePendingAssertions(State);
+    C.addSink();
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
@@ -2665,6 +2794,32 @@ public:
     }
     if (applyAssertionCall(Call, Semantics, C))
       return;
+    if (Semantics.kind == SemanticCallKind::KsftOutcome &&
+        Semantics.outcome && !Semantics.terminal) {
+      ProgramStateRef State =
+          completeActiveGuards(C.getState(), *Semantics.outcome);
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
+    }
+    if (Semantics.kind == SemanticCallKind::KsftResultCode) {
+      if (Call.getNumArgs() > 0) {
+        if (const llvm::APSInt *Code = Call.getArgSVal(0).getAsInteger()) {
+          if (Code->getBitWidth() <= 64) {
+            int64_t Value = Code->isUnsigned()
+                                ? static_cast<int64_t>(Code->getZExtValue())
+                                : Code->getSExtValue();
+            if (auto Outcome = ksftOutcomeForCode(Value)) {
+              ProgramStateRef State =
+                  completeActiveGuards(C.getState(), *Outcome);
+              if (State != C.getState())
+                C.addTransition(State);
+            }
+          }
+        }
+      }
+      return;
+    }
     if (Semantics.operation) {
       if (modelableOperation(Call, Semantics, C))
         return;
@@ -2680,6 +2835,15 @@ public:
   }
 
   void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
+    if (Compare->isAssignmentOp() &&
+        (skipMacroAt(Compare->getOperatorLoc(), C) ||
+         skipMacroAt(Compare->getExprLoc(), C))) {
+      ProgramStateRef State =
+          completeActiveGuards(C.getState(), PathOutcome::Skip);
+      if (State != C.getState())
+        C.addTransition(State);
+      return;
+    }
     if (!Compare->isComparisonOp())
       return;
     ProgramStateRef State = C.getState();
@@ -2769,18 +2933,8 @@ public:
   void checkEndFunction(const ReturnStmt *, CheckerContext &C) const {
     if (!C.inTopFrame() || !ActiveCollector)
       return;
-    for (const AssertionMarker *Marker :
-         C.getState()->get<PendingAssertions>()) {
-      if (auto Domains = domainsForMarker(Marker, C.getState()))
-        if (auto Scenario =
-                materializeScenario(Marker, std::move(*Domains), C.getState()))
-          ActiveCollector->observe(Marker, std::move(*Scenario));
-    }
-    for (const AssertionMarker *Marker : C.getState()->get<ActiveGuards>())
-      if (auto Domains = domainsForMarker(Marker, C.getState()))
-        if (auto Scenario =
-                materializeScenario(Marker, std::move(*Domains), C.getState()))
-          ActiveCollector->observe(Marker, std::move(*Scenario));
+    observePendingAssertions(C.getState());
+    observeActiveGuards(C.getState());
   }
 };
 

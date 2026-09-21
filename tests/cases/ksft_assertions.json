@@ -9,10 +9,48 @@
       }
     }
   ],
+  "ksft_counter_pass_error": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [312, 41, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_counter_pass_fail": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [311, 40, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_counter_failure_then_later_test": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [331, 62, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_counter_skip_is_not_oracle": [],
+  "ksft_counter_xfail_is_not_oracle": [],
+  "ksft_counter_xpass_is_not_oracle": [],
+  "ksft_direct_exit_pass": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [310, 39, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
   "ksft_equality": [
     {
       "syscall": "pidfd_getfd",
       "args": [301, 30, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_error_reporter_is_failure": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [330, 59, 0],
       "result": {"ret": {"op": "==", "value": 0}}
     }
   ],
@@ -27,6 +65,15 @@
     }
   ],
   "ksft_exit_skip_is_not_oracle": [],
+  "ksft_exit_xfail_is_not_oracle": [],
+  "ksft_exit_xpass_is_not_oracle": [],
+  "ksft_failure_reporter_then_later_test": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [332, 63, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
   "ksft_ordering": [
     {
       "syscall": "pidfd_getfd",
@@ -58,5 +105,41 @@
       "result": {"ret": {"op": "==", "value": 0}}
     }
   ],
-  "ksft_skip_is_not_oracle": []
+  "ksft_result_code_pass_fail": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [321, 50, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_result_code_skip_is_not_oracle": [],
+  "ksft_result_code_xfail_is_not_oracle": [],
+  "ksft_result_code_xpass_is_not_oracle": [],
+  "ksft_result_report_pass_fail": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [320, 49, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_result_report_skip_is_not_oracle": [],
+  "ksft_result_report_xfail_is_not_oracle": [],
+  "ksft_result_report_xpass_is_not_oracle": [],
+  "ksft_nonpass_reporters_then_later_test": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [333, 64, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_sequential_skip_scope": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [322, 51, 0],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ksft_skip_is_not_oracle": [],
+  "ksft_xfail_is_not_oracle": [],
+  "ksft_xpass_is_not_oracle": []
 }
