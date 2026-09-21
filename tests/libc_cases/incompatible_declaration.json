@@ -1,0 +1,11 @@
+{
+  "variants": {
+    "profile_enabled": {
+      "target": "x86_64-linux-gnu",
+      "profile": "glibc-linux-x86_64",
+      "functions": {
+        "incompatible_close": []
+      }
+    }
+  }
+}

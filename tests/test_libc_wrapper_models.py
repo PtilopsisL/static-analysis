@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The opt-in glibc profile must model only its declared ABI boundary."""
+"""Run paired C/JSON contracts for the opt-in glibc wrapper profile."""
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -10,84 +11,60 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CASES = ROOT / "tests/libc_cases"
 EXTRACTOR = Path(os.environ.get("SYSCALL_EXTRACTOR", ROOT / "build/syscall-extract"))
 CLANG = os.environ.get("CLANG", shutil.which("clang-21") or shutil.which("clang"))
 
-SOURCE = r"""
-#define O_RDONLY 0
-#define O_CREAT 0100
-extern void test__fail(void);
-#define EXPECT_OP(expected, seen, op) do { \
-  __typeof__(expected) e = (expected);       \
-  __typeof__(seen) s = (seen);               \
-  if (!(e op s)) test__fail();               \
-} while (0)
-#define EXPECT_EQ(expected, seen) EXPECT_OP(expected, seen, ==)
-#define EXPECT_GE(seen, minimum) EXPECT_OP(seen, minimum, >=)
 
-extern int *__errno_location(void) __attribute__((const));
-#define errno (*__errno_location())
-extern int close(int);
-extern int eventfd(unsigned, int);
-extern int open(const char *, int, ...);
-extern int ioctl(int, unsigned long, ...);
+def canonical(record):
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-static void close_success(void) {
-  int result = close(9);
-  EXPECT_EQ(0, result);
-}
 
-static void renamed_eventfd(void) {
-  int fd = eventfd(3, 0);
-  EXPECT_GE(fd, 0);
-}
+def load_cases():
+    sources = {path.stem: path for path in CASES.glob("*.c")}
+    answers = {path.stem: path for path in CASES.glob("*.json")}
+    if set(sources) != set(answers):
+        missing_source = sorted(set(answers) - set(sources))
+        missing_answer = sorted(set(sources) - set(answers))
+        raise RuntimeError(
+            f"unpaired libc cases: missing C={missing_source}, "
+            f"missing JSON={missing_answer}"
+        )
 
-static void open_nomode(void) {
-  int fd = open("input", O_RDONLY);
-  EXPECT_GE(fd, 0);
-}
+    result = []
+    for name in sorted(sources):
+        document = json.loads(answers[name].read_text())
+        variants = document.get("variants") if isinstance(document, dict) else None
+        if not isinstance(variants, dict) or not variants:
+            raise RuntimeError(f"{answers[name]} must contain non-empty variants")
+        for variant_name, variant in variants.items():
+            if not isinstance(variant, dict):
+                raise RuntimeError(f"invalid libc variant {name}:{variant_name}")
+            target = variant.get("target")
+            profile = variant.get("profile")
+            functions = variant.get("functions")
+            if not isinstance(target, str) or not isinstance(profile, str):
+                raise RuntimeError(f"invalid options for {name}:{variant_name}")
+            if not isinstance(functions, dict) or not functions:
+                raise RuntimeError(f"invalid functions for {name}:{variant_name}")
+            for function, records in functions.items():
+                if not isinstance(function, str) or not isinstance(records, list):
+                    raise RuntimeError(
+                        f"invalid expected records for {name}:{variant_name}:{function}"
+                    )
+                result.append(
+                    (name, sources[name], variant_name, target, profile,
+                     function, records)
+                )
+    return result
 
-static void open_create(void) {
-  int fd = open("created", O_CREAT, 0640);
-  EXPECT_GE(fd, 0);
-}
 
-static void open_ignored_mode(void) {
-  int fd = open("input", O_RDONLY, 0777);
-  EXPECT_GE(fd, 0);
-}
+LIBC_CASES = load_cases()
 
-static void open_unknown_flags(int flags) {
-  int fd = open("input", flags, 0600);
-  EXPECT_GE(fd, 0);
-}
 
-static void ioctl_output_is_unknown(void) {
-  int available = 0;
-  int result = ioctl(9, 0x541b, &available);
-  EXPECT_EQ(0, result);
-  int fd = eventfd((unsigned)available, 0);
-  EXPECT_GE(fd, 0);
-}
-"""
-
-USER_DEFINITION = r"""
-#define EXPECT_EQ(expected, seen) do { if ((expected) != (seen)) {} } while (0)
-int close(int fd) { return fd; }
-static void user_close(void) {
-  int result = close(9);
-  EXPECT_EQ(9, result);
-}
-"""
-
-INCOMPATIBLE_DECLARATION = r"""
-#define EXPECT_EQ(expected, seen) do { if ((expected) != (seen)) {} } while (0)
-extern long close(long);
-static void incompatible_close(void) {
-  long result = close(9);
-  EXPECT_EQ(0L, result);
-}
-"""
+class LibcCaseLayoutTests(unittest.TestCase):
+    def test_libc_cases_are_paired(self):
+        self.assertTrue(LIBC_CASES)
 
 
 class LibcWrapperModelTests(unittest.TestCase):
@@ -97,85 +74,65 @@ class LibcWrapperModelTests(unittest.TestCase):
         if not CLANG:
             self.skipTest("clang is required")
 
-    def extract(self, source, function, profile=None, target="x86_64-linux-gnu"):
+    def assert_libc_case(self, source, target, profile, function, expected):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            input_path = directory / "input.c"
-            input_path.write_text(source)
             compdb = directory / "compile_commands.json"
             compdb.write_text(json.dumps([{
                 "directory": str(directory),
-                "file": str(input_path),
-                "arguments": [CLANG, f"--target={target}", "-std=gnu11", "-c",
-                              str(input_path), "-o", str(directory / "input.o")],
+                "file": str(source),
+                "arguments": [
+                    CLANG,
+                    f"--target={target}",
+                    "-std=gnu11",
+                    "-c",
+                    str(source),
+                    "-o",
+                    str(directory / (source.stem + ".o")),
+                ],
             }]))
-            command = [str(EXTRACTOR), "--compdb", str(compdb),
-                       "--function", function]
-            if profile:
+            command = [
+                str(EXTRACTOR),
+                "--compdb",
+                str(compdb),
+                "--unit-index",
+                "0",
+                "--function",
+                function,
+            ]
+            if profile != "none":
                 command.extend(("--libc-profile", profile))
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            return json.loads(result.stdout)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["libc_profile"], profile)
+            self.assertEqual(
+                Counter(map(canonical, data["records"])),
+                Counter(map(canonical, expected)),
+            )
 
-    def records(self, function, **options):
-        return self.extract(SOURCE, function, **options)["records"]
 
-    def test_profile_is_explicit(self):
-        self.assertEqual(self.records("close_success"), [])
-        data = self.extract(SOURCE, "close_success",
-                            profile="glibc-linux-x86_64")
-        self.assertEqual(data["libc_profile"], "glibc-linux-x86_64")
-        self.assertEqual(data["records"], [{
-            "syscall": "close", "args": [9],
-            "result": {"ret": {"op": "==", "value": 0}},
-        }])
+def make_libc_test(source, target, profile, function, expected):
+    def test(self):
+        self.assert_libc_case(source, target, profile, function, expected)
 
-    def test_profile_requires_matching_abi(self):
-        self.assertEqual(self.records("close_success",
-                                      profile="glibc-linux-x86_64",
-                                      target="aarch64-linux-gnu"), [])
+    return test
 
-    def test_user_definition_is_not_replaced(self):
-        data = self.extract(USER_DEFINITION, "user_close",
-                            profile="glibc-linux-x86_64")
-        self.assertEqual(data["records"], [])
 
-    def test_incompatible_external_declaration_is_not_replaced(self):
-        data = self.extract(INCOMPATIBLE_DECLARATION, "incompatible_close",
-                            profile="glibc-linux-x86_64")
-        self.assertEqual(data["records"], [])
-
-    def test_renamed_wrapper(self):
-        self.assertEqual(self.records("renamed_eventfd",
-                                      profile="glibc-linux-x86_64"), [{
-            "syscall": "eventfd2", "args": [3, 0],
-            "result": {"ret": {"op": ">=", "value": 0}},
-        }])
-
-    def test_open_argument_transformations(self):
-        expectations = {
-            "open_nomode": [-100, "input", 0, 0],
-            "open_create": [-100, "created", 64, 416],
-            "open_ignored_mode": [-100, "input", 0, 0],
-        }
-        for function, arguments in expectations.items():
-            with self.subTest(function=function):
-                self.assertEqual(self.records(function,
-                                              profile="glibc-linux-x86_64"), [{
-                    "syscall": "openat", "args": arguments,
-                    "result": {"ret": {"op": ">=", "value": 0}},
-                }])
-
-    def test_unknown_open_flags_are_not_guessed(self):
-        self.assertEqual(self.records("open_unknown_flags",
-                                      profile="glibc-linux-x86_64"), [])
-
-    def test_output_invalidation_prevents_stale_followup(self):
-        self.assertEqual(self.records("ioctl_output_is_unknown",
-                                      profile="glibc-linux-x86_64"), [{
-            "syscall": "ioctl", "args": [9, 21531, {"pointee": 0}],
-            "result": {"ret": {"op": "==", "value": 0}},
-        }])
+for (case_name, case_source, case_variant, case_target, case_profile,
+     case_function, case_expected) in LIBC_CASES:
+    test_name = f"test_{case_name}_{case_variant}_{case_function}"
+    setattr(
+        LibcWrapperModelTests,
+        test_name,
+        make_libc_test(
+            case_source,
+            case_target,
+            case_profile,
+            case_function,
+            case_expected,
+        ),
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,51 @@
+{
+  "libc_fcntl": [
+    {
+      "syscall": "fcntl",
+      "args": [9, 4, 2048],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "libc_getpid": [
+    {
+      "syscall": "getpid",
+      "args": [],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "libc_access": [
+    {
+      "syscall": "access",
+      "args": ["input", 4],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "libc_kill": [
+    {
+      "syscall": "kill",
+      "args": [123, 9],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ltp_safe_close": [
+    {
+      "syscall": "close",
+      "args": [9],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "ltp_safe_open": [
+    {
+      "syscall": "openat",
+      "args": [-100, "input", 0, 0],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
+  "ltp_safe_write": [
+    {
+      "syscall": "write",
+      "args": [9, "abc", 3],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ]
+}

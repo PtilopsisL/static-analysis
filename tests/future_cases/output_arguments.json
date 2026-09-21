@@ -1,0 +1,23 @@
+{
+  "pure_output_buffer": [
+    {
+      "syscall": "sysfs",
+      "args": [2, 0, {"out": {"size": 40}}],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ],
+  "timer_output_dependency": [
+    {
+      "setup": [
+        {
+          "syscall": "timer_create",
+          "args": [0, 0, {"out": {"bind": "timer_id"}}],
+          "result": {"ret": {"op": "==", "value": 0}}
+        }
+      ],
+      "syscall": "timer_delete",
+      "args": [{"ref": "timer_id"}],
+      "result": {"ret": {"op": "==", "value": 0}}
+    }
+  ]
+}

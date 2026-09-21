@@ -1,0 +1,14 @@
+{
+  "run": [
+    {
+      "syscall": "pidfd_getfd",
+      "args": [10, 100, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    },
+    {
+      "syscall": "pidfd_getfd",
+      "args": [20, 200, 0],
+      "result": {"ret": {"op": "==", "value": -1}}
+    }
+  ]
+}

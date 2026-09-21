@@ -1,0 +1,67 @@
+{
+  "variants": {
+    "profile_disabled": {
+      "target": "x86_64-linux-gnu",
+      "profile": "none",
+      "functions": {
+        "close_success": []
+      }
+    },
+    "profile_enabled": {
+      "target": "x86_64-linux-gnu",
+      "profile": "glibc-linux-x86_64",
+      "functions": {
+        "close_success": [
+          {
+            "syscall": "close",
+            "args": [9],
+            "result": {"ret": {"op": "==", "value": 0}}
+          }
+        ],
+        "renamed_eventfd": [
+          {
+            "syscall": "eventfd2",
+            "args": [3, 0],
+            "result": {"ret": {"op": ">=", "value": 0}}
+          }
+        ],
+        "open_nomode": [
+          {
+            "syscall": "openat",
+            "args": [-100, "input", 0, 0],
+            "result": {"ret": {"op": ">=", "value": 0}}
+          }
+        ],
+        "open_create": [
+          {
+            "syscall": "openat",
+            "args": [-100, "created", 64, 416],
+            "result": {"ret": {"op": ">=", "value": 0}}
+          }
+        ],
+        "open_ignored_mode": [
+          {
+            "syscall": "openat",
+            "args": [-100, "input", 0, 0],
+            "result": {"ret": {"op": ">=", "value": 0}}
+          }
+        ],
+        "open_unknown_flags": [],
+        "ioctl_output_is_unknown": [
+          {
+            "syscall": "ioctl",
+            "args": [9, 21531, {"pointee": 0}],
+            "result": {"ret": {"op": "==", "value": 0}}
+          }
+        ]
+      }
+    },
+    "nonmatching_abi": {
+      "target": "aarch64-linux-gnu",
+      "profile": "glibc-linux-x86_64",
+      "functions": {
+        "close_success": []
+      }
+    }
+  }
+}
