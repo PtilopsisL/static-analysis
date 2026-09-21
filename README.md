@@ -62,6 +62,8 @@ build/syscall-extract \
 --function=NAME   指定顶层分析函数
 --all-functions   分析该编译单元中的所有函数
 --syscall=NAME    只输出指定 syscall；可重复
+--libc-profile=glibc-linux-x86_64
+                  显式启用 Linux x86-64/glibc wrapper 模型
 ```
 
 输出同时记录选中的命令索引、工作目录、源码和完整命令行，便于确认实际分析配置。
@@ -81,6 +83,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 python3 scan_artifacts.py /path/to/build/compile_commands.json \
   --include '*/openat2/*' \
   --syscall openat2 \
+  --libc-profile glibc-linux-x86_64 \
   --output /path/to/new-output
 ```
 
@@ -125,6 +128,8 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 当前 checker 处理：
 
 - 直接或经可内联 wrapper 调用的 libc `syscall`；
+- 在显式选择 `glibc-linux-x86_64` profile 时，对经过审核的外部 libc
+  wrapper 使用分析期语义模型；
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
 - 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并通过统一的 call-semantics dispatcher 为 ksft、BPF、nolibc 和 LTP 提供薄语义适配；不依赖 `__exp` / `__seen` 之类临时变量名；
 - LTP 风格的 `TEST` / `TST_RET` / `TST_ERR` 传播、`TST_EXP_*` 结果路径和单个具体 errno 的 `tst_errno_in_set`；`TFAIL` / `TBROK` 作为拒绝路径，`TCONF` 只跳过路径而不形成 oracle，`TPASS` / `TINFO` 等不会被误判为失败；
@@ -132,6 +137,33 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 - 指向具体结构体和字符串的 syscall 参数快照。
 
 控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
+
+## libc wrapper 分析模型
+
+默认 `--libc-profile=none`，提取器不会仅凭函数名称猜测最终链接的 libc。
+选择 `--libc-profile=glibc-linux-x86_64` 表示调用者确认该编译单元最终使用这一
+libc/ABI 组合。输出中的 `libc_profile` 字段记录本次选择。
+
+当前原型在分析阶段把一组简单 wrapper 规范化为现有的 syscall `Invocation`：
+
+- 同名直接调用：`close`、`write` 和 `ioctl`；
+- 改名调用：`eventfd → eventfd2`；
+- 参数转换：`open/openat → openat`，补充 `AT_FDCWD`，并按具体 flags 决定
+  使用调用方 mode 还是 0。
+
+模型只匹配 Linux x86-64 LP64、没有可见函数体的全局 C 函数，以及经过检查的
+glibc 声明类型。源码中可见的同名用户实现、不同 ABI 或不兼容声明不会被替换。
+`open/openat` 的 flags 必须在当前路径上为具体值；不能确定是否需要 mode 时不生成
+记录。模型以保守欠近似为原则，不会为未知参数猜值。
+
+模型还声明已知输出内存：`ioctl` 的第三个参数在调用后失效为未知值，防止后续
+syscall 错误地复用调用前内容。当前处理是保守失效，并不尝试推断任意 request
+的具体输出。
+
+这些是分析期模型，不参与目标程序的编译或链接。`tests/wrappers` 仍调用并用 ptrace
+观测真实 glibc，然后把运行事件与使用该 profile 得到的静态 records 做严格比较。
+模型的适用声明仍是一项外部假设；动态对照覆盖已测试输入，不构成所有 glibc 版本和
+所有输入的形式化等价证明。
 
 `argument_ranges` 测试定义了 argument domain 的目标表示：单值仍直接写成 JSON 值；其他情况写成 `{"domain": [...]}`。`domain` 的列表元素之间为 OR，数字表示一个离散点，比较对象中的字段为 AND。例如 `[1, 2, 4, 8, {">": 20, "<=": 30}]` 表示 `{1, 2, 4, 8}` 与 `20 < arg <= 30` 的并集。只有其他参数和 result 相同、无需保留跨参数相关性时，才能把这些候选合并到同一条 record。
 

@@ -89,8 +89,7 @@
     "returns": [{"ret": 0, "errno": 123}, {"ret": -1, "errno": 9}, {"ret": -1, "errno": 9}],
     "records": [
       {"syscall": "close", "args": [9], "result": {"ret": {"op": "==", "value": 0}}},
-      {"syscall": "close", "args": [9], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}},
-      {"syscall": "close", "args": [-1], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}}
+      {"syscall": "close", "args": [{"domain": [-1, 9]}], "result": {"ret": {"op": "==", "value": -1}, "errno": {"op": "==", "value": 9}}}
     ]
   }
 }

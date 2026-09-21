@@ -22,8 +22,9 @@ python3 -B tests/wrappers/run.py --check-analysis \
 ```
 
 `--output` 必须是尚不存在的目录；省略时在 `/tmp` 下创建并打印产物位置。
-当前提取器尚未实现 libc wrapper，因此第二条命令应报告 wrapper 的缺失记录，
-并以非零状态退出。这不是预期失败豁免，后续实现必须让这些检查通过。
+第二条命令会显式启用提取器的 `glibc-linux-x86_64` 分析 profile；运行器要求
+真实 libc 行为和静态 records 全部通过，否则以非零状态退出。该 profile 不会参与
+probe 的编译或运行，只影响提取器对外部 libc 调用的分析。
 
 单个用例、固定 libc 二进制身份，以及比较器的反例测试：
 

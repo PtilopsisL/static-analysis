@@ -67,6 +67,11 @@ static llvm::cl::opt<bool>
 static llvm::cl::list<std::string>
     Syscalls("syscall", llvm::cl::desc("Syscall name to emit (repeatable)"),
              llvm::cl::cat(Category));
+static llvm::cl::opt<std::string> LibcProfile(
+    "libc-profile",
+    llvm::cl::desc("Analysis-only libc wrapper profile (none or "
+                   "glibc-linux-x86_64)"),
+    llvm::cl::init("none"), llvm::cl::cat(Category));
 
 struct ConcreteValue {
   enum Kind { Integer, String, Object } kind = Integer;
@@ -1153,10 +1158,31 @@ struct CallSemantics {
   SemanticCallKind kind = SemanticCallKind::Unknown;
   ContextEffect contextEffect = ContextEffect::Default;
   struct OperationModel {
+    struct Argument {
+      enum Kind : uint8_t { CallArgument, SignedConstant, UnsignedConstant };
+      Kind kind = CallArgument;
+      unsigned index = 0;
+      uint64_t value = 0;
+
+      static Argument call(unsigned Index) {
+        return {CallArgument, Index, 0};
+      }
+      static Argument signedConstant(int64_t Value) {
+        return {SignedConstant, 0, static_cast<uint64_t>(Value)};
+      }
+      static Argument unsignedConstant(uint64_t Value) {
+        return {UnsignedConstant, 0, Value};
+      }
+    };
+
     std::optional<unsigned> numberArgument;
     unsigned firstArgument = 0;
     std::string fixedName;
     bool modelsErrno = true;
+    /* Empty means forward [firstArgument, getNumArgs()). */
+    std::vector<Argument> arguments;
+    /* Call arguments whose pointee state becomes unknown after the syscall. */
+    std::vector<unsigned> invalidatedArguments;
   };
   std::optional<OperationModel> operation;
 };
@@ -1173,7 +1199,8 @@ class SemanticDispatcher {
       return std::nullopt;
     CallSemantics Result;
     Result.contextEffect = ContextEffect::Preserve;
-    Result.operation = CallSemantics::OperationModel{0, 1, {}, true};
+    Result.operation =
+        CallSemantics::OperationModel{0, 1, {}, true, {}, {}};
     return Result;
   }
 
@@ -1220,8 +1247,175 @@ class SemanticDispatcher {
     return std::nullopt;
   }
 
+  static bool isUnresolvedExternalFunction(const CallEvent &Call) {
+    const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
+    if (!FD || !Call.isGlobalCFunction() || !FD->isExternallyVisible())
+      return false;
+    const FunctionDecl *Definition = nullptr;
+    return !FD->hasBody(Definition);
+  }
+
+  enum class ProfileType : uint8_t {
+    Signed32,
+    Unsigned32,
+    Signed64,
+    Unsigned64,
+    Pointer,
+  };
+
+  static bool matchesProfileType(QualType Type, ProfileType Expected,
+                                 ASTContext &Context) {
+    Type = Type.getCanonicalType();
+    if (Expected == ProfileType::Pointer)
+      return Type->isPointerType();
+    bool Signed = Expected == ProfileType::Signed32 ||
+                  Expected == ProfileType::Signed64;
+    unsigned Width =
+        Expected == ProfileType::Signed32 || Expected == ProfileType::Unsigned32
+            ? 32
+            : 64;
+    return Type->isIntegerType() && Type->isSignedIntegerType() == Signed &&
+           Context.getIntWidth(Type) == Width;
+  }
+
+  static bool matchesDeclaration(
+      const FunctionDecl &FD, ProfileType Return,
+      std::initializer_list<ProfileType> Parameters, bool Variadic,
+      ASTContext &Context) {
+    if (!matchesProfileType(FD.getReturnType(), Return, Context) ||
+        FD.isVariadic() != Variadic || FD.getNumParams() != Parameters.size())
+      return false;
+    unsigned Index = 0;
+    for (ProfileType Type : Parameters)
+      if (!matchesProfileType(FD.getParamDecl(Index++)->getType(), Type,
+                              Context))
+        return false;
+    return true;
+  }
+
+  static bool validGlibcDeclaration(llvm::StringRef Name,
+                                    const FunctionDecl &FD,
+                                    ASTContext &Context) {
+    using T = ProfileType;
+    if (Name == "close")
+      return matchesDeclaration(FD, T::Signed32, {T::Signed32}, false,
+                                Context);
+    if (Name == "write")
+      return matchesDeclaration(
+          FD, T::Signed64, {T::Signed32, T::Pointer, T::Unsigned64}, false,
+          Context);
+    if (Name == "ioctl")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Signed32, T::Unsigned64}, true, Context);
+    if (Name == "eventfd")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Unsigned32, T::Signed32}, false, Context);
+    if (Name == "open")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Pointer, T::Signed32}, true, Context);
+    if (Name == "openat")
+      return matchesDeclaration(
+          FD, T::Signed32, {T::Signed32, T::Pointer, T::Signed32}, true,
+          Context);
+    return false;
+  }
+
+  static bool supportsGlibcX8664(const CallEvent &Call, CheckerContext &C) {
+    if (LibcProfile != "glibc-linux-x86_64" ||
+        !isUnresolvedExternalFunction(Call))
+      return false;
+    const llvm::Triple &Triple = C.getASTContext().getTargetInfo().getTriple();
+    ASTContext &Context = C.getASTContext();
+    return Triple.getArch() == llvm::Triple::x86_64 && Triple.isOSLinux() &&
+           !Triple.isMusl() && Context.getTypeSize(Context.IntTy) == 32 &&
+           Context.getTypeSize(Context.LongTy) == 64 &&
+           Context.getTypeSize(Context.VoidPtrTy) == 64;
+  }
+
+  static CallSemantics fixedOperation(
+      llvm::StringRef Name,
+      std::vector<CallSemantics::OperationModel::Argument> Arguments = {},
+      std::vector<unsigned> InvalidatedArguments = {}) {
+    CallSemantics Result;
+    Result.contextEffect = ContextEffect::Preserve;
+    Result.operation = CallSemantics::OperationModel{
+        std::nullopt, 0, Name.str(), true, std::move(Arguments),
+        std::move(InvalidatedArguments)};
+    return Result;
+  }
+
+  static std::optional<CallSemantics>
+  glibcX8664Adapter(const CallEvent &Call, CheckerContext &C) {
+    if (!supportsGlibcX8664(Call, C))
+      return std::nullopt;
+    const auto *FD = dyn_cast<FunctionDecl>(Call.getDecl());
+    llvm::StringRef Name = FD->getName();
+    if (!validGlibcDeclaration(Name, *FD, C.getASTContext()))
+      return std::nullopt;
+
+    struct DirectModel {
+      llvm::StringLiteral wrapper;
+      llvm::StringLiteral syscall;
+      unsigned argumentCount;
+      int firstOutputArgument;
+      int secondOutputArgument;
+    };
+    static constexpr DirectModel Direct[] = {
+        {"close", "close", 1, -1, -1},
+        {"write", "write", 3, -1, -1},
+        {"ioctl", "ioctl", 3, 2, -1},
+    };
+    for (const DirectModel &Model : Direct) {
+      if (Name != Model.wrapper || Call.getNumArgs() != Model.argumentCount)
+        continue;
+      std::vector<unsigned> Outputs;
+      if (Model.firstOutputArgument >= 0)
+        Outputs.push_back(static_cast<unsigned>(Model.firstOutputArgument));
+      if (Model.secondOutputArgument >= 0)
+        Outputs.push_back(static_cast<unsigned>(Model.secondOutputArgument));
+      return fixedOperation(Model.syscall, {}, std::move(Outputs));
+    }
+
+    if (Name == "eventfd" && Call.getNumArgs() == 2)
+      return fixedOperation("eventfd2");
+    using Argument = CallSemantics::OperationModel::Argument;
+    unsigned FlagsIndex;
+    unsigned RequiredArguments;
+    std::vector<Argument> Arguments;
+    if (Name == "open" && Call.getNumArgs() >= 2) {
+      FlagsIndex = 1;
+      RequiredArguments = 2;
+      Arguments = {Argument::signedConstant(-100), Argument::call(0),
+                   Argument::call(1)};
+    } else if (Name == "openat" && Call.getNumArgs() >= 3) {
+      FlagsIndex = 2;
+      RequiredArguments = 3;
+      Arguments = {Argument::call(0), Argument::call(1), Argument::call(2)};
+    } else {
+      return std::nullopt;
+    }
+
+    const llvm::APSInt *Flags = Call.getArgSVal(FlagsIndex).getAsInteger();
+    if (!Flags || Flags->getBitWidth() > 64)
+      return std::nullopt;
+    uint64_t Bits = Flags->getZExtValue();
+    constexpr uint64_t OCreat = 0100;
+    constexpr uint64_t OTmpfile = 020200000;
+    bool NeedsMode = (Bits & OCreat) != 0 || (Bits & OTmpfile) == OTmpfile;
+    if (NeedsMode) {
+      if (Call.getNumArgs() != RequiredArguments + 1)
+        return std::nullopt;
+      Arguments.push_back(Argument::call(RequiredArguments));
+    } else {
+      /* On Linux x86-64 O_LARGEFILE is zero. Extra variadic arguments are
+       * ignored exactly as in the glibc wrapper. */
+      Arguments.push_back(Argument::unsignedConstant(0));
+    }
+    return fixedOperation("openat", std::move(Arguments));
+  }
+
 public:
-  static CallSemantics classify(const CallEvent &Call) {
+  static CallSemantics classify(const CallEvent &Call, CheckerContext &C) {
     const auto *ND = dyn_cast_or_null<NamedDecl>(Call.getDecl());
     if (!ND)
       return {};
@@ -1231,6 +1425,8 @@ public:
     for (Adapter Match : Adapters)
       if (auto Result = Match(Name))
         return std::move(*Result);
+    if (auto Result = glibcX8664Adapter(Call, C))
+      return std::move(*Result);
     return {};
   }
 };
@@ -1925,6 +2121,13 @@ static bool modelableOperation(const CallEvent &Call,
       !ActiveCollector->wantsFunction(functionName(C.getLocationContext())))
     return false;
   const CallSemantics::OperationModel &Operation = *Semantics.operation;
+  for (const auto &Argument : Operation.arguments)
+    if (Argument.kind == CallSemantics::OperationModel::Argument::CallArgument &&
+        Argument.index >= Call.getNumArgs())
+      return false;
+  for (unsigned Index : Operation.invalidatedArguments)
+    if (Index >= Call.getNumArgs())
+      return false;
   if (Operation.firstArgument > Call.getNumArgs())
     return false;
   if (!Operation.numberArgument)
@@ -2310,7 +2513,7 @@ public:
   }
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
-    CallSemantics Semantics = SemanticDispatcher::classify(Call);
+    CallSemantics Semantics = SemanticDispatcher::classify(Call, C);
     if (Semantics.kind == SemanticCallKind::Failure) {
       markFailureGuards(C.getState());
       C.addSink();
@@ -2337,7 +2540,7 @@ public:
       Value.syscall = Operation.fixedName;
     }
     Value.eventSite = Call.getOriginExpr();
-    for (unsigned I = Operation.firstArgument; I < Call.getNumArgs(); ++I) {
+    auto CaptureArgument = [&](unsigned I) {
       SVal ArgumentValue = Call.getArgSVal(I);
       QualType ArgumentType = Call.getArgExpr(I)->getType();
       const auto *ArgumentRef =
@@ -2346,25 +2549,38 @@ public:
           ArgumentRef ? ArgumentRef->getDecl() : nullptr;
       if (const Invocation *Producer = dependencyProducer(
               ArgumentValue, ArgumentType, C.getState(), C.getASTContext())) {
-        Value.args.push_back(CapturedArgument::reference(Producer));
-        continue;
+        return CapturedArgument::reference(Producer);
       }
       if (auto Concrete = snapshotValue(ArgumentValue, ArgumentType,
                                         C.getState(), C.getLocationContext())) {
-        Value.args.push_back(
-            CapturedArgument::concreteValue(std::move(*Concrete), SourceDecl));
-        continue;
+        return CapturedArgument::concreteValue(std::move(*Concrete),
+                                               SourceDecl);
       }
       SymbolRef Symbol = ArgumentValue.getAsSymbol(true);
       if (Symbol && ArgumentType->isIntegerType()) {
         std::vector<SymbolRef> Atoms;
         for (SymbolRef Atom : ArgumentValue.symbols())
           Atoms.push_back(Atom);
-        Value.args.push_back(CapturedArgument::symbolicValue(
-            Symbol, std::move(Atoms), SourceDecl));
-        continue;
+        return CapturedArgument::symbolicValue(Symbol, std::move(Atoms),
+                                               SourceDecl);
       }
-      Value.args.emplace_back();
+      return CapturedArgument{};
+    };
+    if (Operation.arguments.empty()) {
+      for (unsigned I = Operation.firstArgument; I < Call.getNumArgs(); ++I)
+        Value.args.push_back(CaptureArgument(I));
+    } else {
+      using Argument = CallSemantics::OperationModel::Argument;
+      for (const Argument &Model : Operation.arguments) {
+        if (Model.kind == Argument::CallArgument) {
+          Value.args.push_back(CaptureArgument(Model.index));
+        } else {
+          Value.args.push_back(CapturedArgument::concreteValue(
+              ConcreteValue::integer(Model.value,
+                                     Model.kind == Argument::UnsignedConstant),
+              nullptr));
+        }
+      }
     }
     SVal Return = C.getSValBuilder().conjureSymbolVal(
         Call, Call.getResultType(), C.blockCount(), this);
@@ -2378,8 +2594,22 @@ public:
       return false;
     const Invocation *Stored =
         ActiveCollector->makeInvocation(std::move(Value));
-    ProgramStateRef State = C.getState()->BindExpr(
-        Call.getOriginExpr(), C.getLocationContext(), Return);
+    ProgramStateRef State = C.getState();
+    if (!Operation.invalidatedArguments.empty()) {
+      std::vector<SVal> Values;
+      Values.reserve(Operation.invalidatedArguments.size());
+      for (unsigned Index : Operation.invalidatedArguments) {
+        SVal Argument = Call.getArgSVal(Index);
+        Values.push_back(Argument);
+        if (const MemRegion *Region = Argument.getAsRegion())
+          State = removeOverlappingRegionProvenance(State, Region);
+      }
+      State = State->invalidateRegions(
+          Values, C.getCFGElementRef(), C.blockCount(), C.getLocationContext(),
+          false, nullptr, &Call);
+    }
+    State = State->BindExpr(Call.getOriginExpr(), C.getLocationContext(),
+                            Return);
     State = State->set<SymbolOwners>(Stored->resultSymbol,
                                      SymbolOwner{Stored, EventField::Result});
     if (Stored->errnoSymbol)
@@ -2407,7 +2637,7 @@ public:
   }
 
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
-    CallSemantics Semantics = SemanticDispatcher::classify(Call);
+    CallSemantics Semantics = SemanticDispatcher::classify(Call, C);
     if (Semantics.kind == SemanticCallKind::BooleanAssertion &&
         Call.getNumArgs() > 0) {
       if (const Expr *Condition = Call.getArgExpr(0))
@@ -2584,6 +2814,10 @@ static std::string absoluteSource(const tooling::CompileCommand &Command) {
 int main(int argc, const char **argv) {
   llvm::cl::HideUnrelatedOptions(Category);
   llvm::cl::ParseCommandLineOptions(argc, argv);
+  if (LibcProfile != "none" && LibcProfile != "glibc-linux-x86_64") {
+    llvm::errs() << "Unsupported libc profile: " << LibcProfile << "\n";
+    return 2;
+  }
   std::string Error;
   auto Database = tooling::JSONCompilationDatabase::loadFromFile(
       CompDB, Error, tooling::JSONCommandLineSyntax::AutoDetect);
@@ -2621,6 +2855,7 @@ int main(int argc, const char **argv) {
   json::Object Output{
       {"schema_version", 2},
       {"source", Source},
+      {"libc_profile", LibcProfile.getValue()},
       {"compilation_unit", json::Object{{"index", UnitIndex.getValue()},
                                         {"directory", Command.Directory},
                                         {"file", Command.Filename},

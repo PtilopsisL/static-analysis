@@ -225,6 +225,8 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--include", action="append", default=[], help="Glob matched against source paths; repeatable")
     parser.add_argument("--syscall", action="append", default=[], help="Only emit this syscall; repeatable")
+    parser.add_argument("--libc-profile", choices=("none", "glibc-linux-x86_64"),
+                        default="none", help="Analysis-only libc wrapper profile")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=20, help="Seconds per compilation unit")
     parser.add_argument("--memory-mb", type=int, default=1024, help="Per-process address space limit")
@@ -256,6 +258,7 @@ def main():
         parser.error(f"output already exists: {output}")
     output.mkdir(parents=True)
     analyzer_args = ["--syscall=" + syscall for syscall in args.syscall]
+    analyzer_args.append("--libc-profile=" + args.libc_profile)
 
     started = time.monotonic()
     summary = {
@@ -276,6 +279,7 @@ def main():
         },
         "include": args.include,
         "syscall_filter": args.syscall,
+        "libc_profile": args.libc_profile,
     }
     write_json(output / "summary.json", summary)
 

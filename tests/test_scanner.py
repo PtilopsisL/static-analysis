@@ -115,6 +115,8 @@ class EndToEndTests(unittest.TestCase):
                     str(output),
                     "--jobs",
                     "2",
+                    "--libc-profile",
+                    "glibc-linux-x86_64",
                 ],
                 capture_output=True,
                 text=True,
@@ -139,6 +141,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(summary["compilation_units"], 3)
             self.assertEqual(summary["processed_units"], 3)
             self.assertEqual(sum(summary["unit_status_counts"].values()), 3)
+            self.assertEqual(summary["libc_profile"], "glibc-linux-x86_64")
+            self.assertTrue(all("--libc-profile=glibc-linux-x86_64" in
+                                row["execution"]["command"] for row in rows.values()))
 
 
 if __name__ == "__main__":

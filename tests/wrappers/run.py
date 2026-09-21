@@ -159,7 +159,8 @@ def identity(trace, expected_symbols, expected_hash=None):
 
 def check_analysis(extractor, compdb, name, contract, directory, timeout):
     result = process([str(extractor), "--compdb", str(compdb), "--unit-index", "0",
-                      "--function", name], directory, timeout)
+                      "--function", name, "--libc-profile", "glibc-linux-x86_64"],
+                     directory, timeout)
     write_json(directory / "analysis-process.json", result)
     if result["timed_out"] or result["returncode"]:
         return {"status": "error", "errors": ["extractor failed; see analysis-process.json"]}
