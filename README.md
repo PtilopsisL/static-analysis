@@ -133,8 +133,11 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
 - 通过统一的 outcome-effect dispatcher 为 ksft、BPF、nolibc 和 LTP 提供薄语义适配，并把 `struct __test_metadata::exit_code` 的已知状态写入识别为 harness outcome；不匹配 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 等宏名，也不依赖 `_metadata`、`__exp` 或 `__seen` 等变量名；
 - LTP 风格的 `TEST` / `TST_RET` / `TST_ERR` 传播、`TST_EXP_*` 结果路径和单个具体 errno 的 `tst_errno_in_set`；`TFAIL` / `TBROK` 作为拒绝路径，`TCONF` 只跳过路径而不形成 oracle，`TPASS` / `TINFO` 等不会被误判为失败；
+- LTP `struct tst_test` 的 `.tcnt + .test(n)` 入口展开：为每个 `n` 建立独立
+  分析状态，并从静态表初始化器还原 `cases[n]` 的具体字段；
 - syscall 返回值以及紧随其后的 `errno` 约束；
-- 指向具体结构体和字符串的 syscall 参数快照。
+- 指向具体结构体和字符串的 syscall 参数快照，以及已建模的纯输出参数；纯输出
+  数组写成 `{"out":{"size":N}}`，其调用前未初始化内容不会被读取。
 
 控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他框架或 API 时，应增加只负责声明 outcome effect、boundary policy 或 framework state transfer 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。outcome epoch 管理生命周期，candidate marker 管理 effect 与 event 的归属；accepted alternatives 只在同一 observation group 内做精确并集，避免把条件 assertion 的 bypass path 混入该 assertion。
 
@@ -146,10 +149,16 @@ libc/ABI 组合。输出中的 `libc_profile` 字段记录本次选择。
 
 当前原型在分析阶段把一组简单 wrapper 规范化为现有的 syscall `Invocation`：
 
-- 同名直接调用：`close`、`write` 和 `ioctl`；
+- 同名直接调用：`close`、`write`、`ioctl`、`fcntl`、`getpid`、`access`
+  和 `kill`；
 - 改名调用：`eventfd → eventfd2`；
 - 参数转换：`open/openat → openat`，补充 `AT_FDCWD`，并按具体 flags 决定
-  使用调用方 mode 还是 0。
+  使用调用方 mode 还是 0；
+- LTP `safe_close`、`safe_open` 和 `safe_write`：剥离 file/line/cleanup 等
+  harness 参数，并记录 SAFE wrapper 保证的成功返回范围。
+
+`safe_write` 会区分 `SAFE_WRITE_ANY` 与 `SAFE_WRITE_ALL`；可能发出多次底层
+`write` 的 `SAFE_WRITE_RETRY` 暂不建模，避免把多次调用错误折叠成一次。
 
 模型只匹配 Linux x86-64 LP64、没有可见函数体的全局 C 函数，以及经过检查的
 glibc 声明类型。源码中可见的同名用户实现、不同 ABI 或不兼容声明不会被替换。
@@ -158,7 +167,10 @@ glibc 声明类型。源码中可见的同名用户实现、不同 ABI 或不兼
 
 模型还声明已知输出内存：`ioctl` 的第三个参数在调用后失效为未知值，防止后续
 syscall 错误地复用调用前内容。当前处理是保守失效，并不尝试推断任意 request
-的具体输出。
+的具体输出。纯输出方向则不读取调用前 pointee；若输出标量随后成为另一个 syscall
+的参数，setup 中的输出位置使用 `{"out":{"bind":"name"}}`，消费者使用
+`{"ref":"name"}`。例如 `timer_create` 写出的 timer ID 可以作为
+`timer_delete` 的依赖。
 
 这些是分析期模型，不参与目标程序的编译或链接。`tests/wrappers` 仍调用并用 ptrace
 观测真实 glibc，然后把运行事件与使用该 profile 得到的静态 records 做严格比较。

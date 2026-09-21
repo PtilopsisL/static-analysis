@@ -3,10 +3,14 @@
  * executed. The declarations mirror common glibc and LTP wrapper shapes.
  */
 #define O_RDONLY 0
-#define SAFE_WRITE_ANY 0
-
 typedef long ssize_t;
 typedef unsigned long size_t;
+
+enum safe_write_opts {
+  SAFE_WRITE_ANY = 0,
+  SAFE_WRITE_ALL = 1,
+  SAFE_WRITE_RETRY = 2,
+};
 
 extern void test__fail(void);
 #define EXPECT_EQ(expected, seen) do { \
@@ -25,11 +29,17 @@ extern int safe_close(const char *file, int line, void (*cleanup)(void), int fd)
 extern int safe_open(const char *file, int line, void (*cleanup)(void),
                      const char *path, int flags, ...);
 extern ssize_t safe_write(const char *file, int line, void (*cleanup)(void),
-                          int strict, int fd, const void *buffer, size_t count);
+                          enum safe_write_opts strict, int fd,
+                          const void *buffer, size_t count);
 
 static void libc_fcntl(void) {
   int result = fcntl(9, 4, 04000);
   EXPECT_EQ(0, result);
+}
+
+static void libc_fcntl_getfd(void) {
+  int result = fcntl(9, 1);
+  EXPECT_GE(result, 0);
 }
 
 static void libc_getpid(void) {
@@ -61,4 +71,12 @@ static void ltp_safe_write(void) {
   ssize_t written = safe_write(__FILE__, __LINE__, 0, SAFE_WRITE_ANY,
                                9, "abc", 3);
   EXPECT_GE(written, 0);
+}
+
+static void ltp_safe_write_all(void) {
+  safe_write(__FILE__, __LINE__, 0, SAFE_WRITE_ALL, 9, "abc", 3);
+}
+
+static void ltp_safe_write_retry_is_conservative(void) {
+  safe_write(__FILE__, __LINE__, 0, SAFE_WRITE_RETRY, 9, "abc", 3);
 }

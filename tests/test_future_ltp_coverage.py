@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run paired future LTP C/JSON contracts as explicit expected failures."""
+"""Run paired LTP coverage contracts with JSON-backed expected records."""
 from collections import Counter
 import json
 import os
@@ -99,7 +99,6 @@ class FutureLtpCoverageContracts(unittest.TestCase):
 
 
 def make_future_test(source, function, expected):
-    @unittest.expectedFailure
     def test(self):
         self.assert_future_case(source, function, expected)
 

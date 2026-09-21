@@ -6,6 +6,13 @@
       "result": {"ret": {"op": "==", "value": 0}}
     }
   ],
+  "libc_fcntl_getfd": [
+    {
+      "syscall": "fcntl",
+      "args": [9, 1],
+      "result": {"ret": {"op": ">=", "value": 0}}
+    }
+  ],
   "libc_getpid": [
     {
       "syscall": "getpid",
@@ -47,5 +54,13 @@
       "args": [9, "abc", 3],
       "result": {"ret": {"op": ">=", "value": 0}}
     }
-  ]
+  ],
+  "ltp_safe_write_all": [
+    {
+      "syscall": "write",
+      "args": [9, "abc", 3],
+      "result": {"ret": {"op": "==", "value": 3}}
+    }
+  ],
+  "ltp_safe_write_retry_is_conservative": []
 }

@@ -17,13 +17,16 @@
 #include <vector>
 
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Decl.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/ParentMapContext.h>
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/Analysis/CFG.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
+#include <clang/Frontend/MultiplexConsumer.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/StaticAnalyzer/Core/AnalyzerOptions.h>
 #include <clang/StaticAnalyzer/Core/Checker.h>
@@ -74,6 +77,10 @@ static llvm::cl::opt<std::string> LibcProfile(
     llvm::cl::desc("Analysis-only libc wrapper profile (none or "
                    "glibc-linux-x86_64)"),
     llvm::cl::init("none"), llvm::cl::cat(Category));
+
+/* Populated before the analyzer consumer runs for the current translation
+ * unit. Keys are canonical .test callbacks and values are their .tcnt. */
+static std::map<const FunctionDecl *, unsigned> LtpHarnessCaseCounts;
 
 struct ConcreteValue {
   enum Kind { Integer, String, Object } kind = Integer;
@@ -329,12 +336,15 @@ struct ConstraintSet {
 };
 
 struct CapturedArgument {
-  enum Kind { Concrete, Symbolic, Reference, Unsupported } kind = Unsupported;
+  enum Kind { Concrete, Symbolic, Reference, Output, Unsupported } kind =
+      Unsupported;
   ConcreteValue concrete;
   SymbolRef symbol = nullptr;
   std::vector<SymbolRef> atoms;
   const struct Invocation *producer = nullptr;
+  int producerOutputArgument = -1;
   const ValueDecl *sourceDecl = nullptr;
+  std::optional<uint64_t> outputSize;
 
   static CapturedArgument concreteValue(ConcreteValue Value,
                                         const ValueDecl *SourceDecl) {
@@ -356,10 +366,19 @@ struct CapturedArgument {
     return Result;
   }
 
-  static CapturedArgument reference(const struct Invocation *Producer) {
+  static CapturedArgument reference(const struct Invocation *Producer,
+                                    int OutputArgument = -1) {
     CapturedArgument Result;
     Result.kind = Reference;
     Result.producer = Producer;
+    Result.producerOutputArgument = OutputArgument;
+    return Result;
+  }
+
+  static CapturedArgument output(std::optional<uint64_t> Size) {
+    CapturedArgument Result;
+    Result.kind = Output;
+    Result.outputSize = Size;
     return Result;
   }
 };
@@ -371,6 +390,17 @@ struct Invocation {
   const Expr *eventSite = nullptr;
   SymbolRef resultSymbol = nullptr;
   SymbolRef errnoSymbol = nullptr;
+};
+
+struct DependencyKey {
+  const Invocation *call = nullptr;
+  int outputArgument = -1;
+
+  bool operator<(const DependencyKey &Other) const {
+    if (call != Other.call)
+      return std::less<const Invocation *>()(call, Other.call);
+    return outputArgument < Other.outputArgument;
+  }
 };
 
 enum class EventField : uint8_t {
@@ -394,6 +424,20 @@ struct SymbolOwner {
   void Profile(llvm::FoldingSetNodeID &ID) const {
     ID.AddPointer(call);
     ID.AddInteger(static_cast<unsigned>(field));
+  }
+};
+
+struct OutputOwner {
+  const Invocation *call = nullptr;
+  unsigned argument = 0;
+
+  bool operator==(const OutputOwner &Other) const {
+    return call == Other.call && argument == Other.argument;
+  }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const {
+    ID.AddPointer(call);
+    ID.AddInteger(argument);
   }
 };
 
@@ -451,11 +495,13 @@ struct ComparisonHint {
 };
 
 struct MaterializedArgument {
-  enum Kind { Concrete, Domain, Reference } kind = Concrete;
+  enum Kind { Concrete, Domain, Reference, Output } kind = Concrete;
   ConcreteValue concrete;
   IntegerDomain domain;
   std::vector<ResultConstraint> hints;
   std::string reference;
+  std::optional<uint64_t> outputSize;
+  std::string outputBinding;
 };
 
 struct MaterializedCall {
@@ -499,7 +545,7 @@ class Collector {
   std::vector<std::unique_ptr<Provenance>> Provenances;
   std::vector<std::unique_ptr<AssertionMarker>> AssertionMarkers;
   std::vector<std::unique_ptr<ComparisonHint>> ComparisonHints;
-  std::map<const Invocation *, std::string> PreferredBindings;
+  std::map<DependencyKey, std::string> PreferredBindings;
   std::set<std::string> SeenFunctions;
   std::vector<ObservationGroup> ObservationGroups;
   std::vector<EmittedRecord> Records;
@@ -608,6 +654,12 @@ class Collector {
 
   static bool argumentEqual(const MaterializedArgument &LHS,
                             const MaterializedArgument &RHS) {
+    if (LHS.kind == MaterializedArgument::Output ||
+        RHS.kind == MaterializedArgument::Output)
+      return LHS.kind == MaterializedArgument::Output &&
+             RHS.kind == MaterializedArgument::Output &&
+             LHS.outputSize == RHS.outputSize &&
+             LHS.outputBinding == RHS.outputBinding;
     if (LHS.kind == MaterializedArgument::Reference ||
         RHS.kind == MaterializedArgument::Reference)
       return LHS.kind == MaterializedArgument::Reference &&
@@ -748,6 +800,14 @@ class Collector {
       return toJSON(Argument.concrete);
     if (Argument.kind == MaterializedArgument::Reference)
       return json::Object{{"ref", Argument.reference}};
+    if (Argument.kind == MaterializedArgument::Output) {
+      json::Object Description;
+      if (!Argument.outputBinding.empty())
+        Description["bind"] = Argument.outputBinding;
+      else if (Argument.outputSize)
+        Description["size"] = *Argument.outputSize;
+      return json::Object{{"out", std::move(Description)}};
+    }
 
     IntegerDomain Domain = Argument.domain;
     normalizeDomain(Domain);
@@ -812,7 +872,7 @@ class Collector {
     for (const MaterializedArgument &Argument : Call.args)
       Args.push_back(argumentJSON(Argument));
     json::Object Object{{"syscall", Call.syscall}, {"args", std::move(Args)}};
-    if (IncludeBind)
+    if (IncludeBind && !Call.bind.empty())
       Object["bind"] = Call.bind;
     if (Call.result.ret || Call.result.error)
       Object["result"] = resultJSON(Call.result);
@@ -907,12 +967,20 @@ public:
   }
 
   void noteBinding(const Invocation *Call, llvm::StringRef Name) {
-    if (Call && !Name.empty() && !PreferredBindings.count(Call))
-      PreferredBindings.emplace(Call, Name.str());
+    DependencyKey Key{Call, -1};
+    if (Call && !Name.empty() && !PreferredBindings.count(Key))
+      PreferredBindings.emplace(Key, Name.str());
   }
 
-  std::string preferredBinding(const Invocation *Call) const {
-    auto It = PreferredBindings.find(Call);
+  void noteOutputBinding(const Invocation *Call, unsigned Argument,
+                         llvm::StringRef Name) {
+    DependencyKey Key{Call, static_cast<int>(Argument)};
+    if (Call && !Name.empty() && !PreferredBindings.count(Key))
+      PreferredBindings.emplace(Key, Name.str());
+  }
+
+  std::string preferredBinding(DependencyKey Key) const {
+    auto It = PreferredBindings.find(Key);
     return It == PreferredBindings.end() ? std::string() : It->second;
   }
 
@@ -1030,8 +1098,10 @@ public:
 
 static Collector *ActiveCollector = nullptr;
 static int ErrnoSymbolTag;
+static int OutputSymbolTag;
 
 REGISTER_MAP_WITH_PROGRAMSTATE(SymbolOwners, SymbolRef, SymbolOwner)
+REGISTER_MAP_WITH_PROGRAMSTATE(OutputOwners, SymbolRef, OutputOwner)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceBySymbol, SymbolRef,
                                const Provenance *)
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByEvaluationSite, EvaluationSite,
@@ -1046,6 +1116,8 @@ REGISTER_SET_WITH_PROGRAMSTATE(ActiveGuards, const AssertionMarker *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentErrnoOwner, const Invocation *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentOutcomeEpoch, unsigned)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(NextOutcomeCandidate, unsigned)
+/* 0 means ordinary entry; harness case N is encoded as N + 1. */
+REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentHarnessCase, unsigned)
 /* 0 is unset/pass-by-default; other values are encoded PathOutcome + 1. */
 REGISTER_TRAIT_WITH_PROGRAMSTATE(FrameworkStatus, unsigned)
 
@@ -1209,6 +1281,8 @@ struct CallSemantics {
     unsigned firstArgument = 0;
     std::string fixedName;
     bool modelsErrno = true;
+    /* Wrappers such as LTP SAFE_* only return when this condition holds. */
+    std::optional<ResultConstraint> acceptedResult;
     /* Empty means forward [firstArgument, getNumArgs()). */
     std::vector<Argument> arguments;
     /* Call arguments whose pointee state becomes unknown after the syscall. */
@@ -1240,8 +1314,10 @@ class SemanticDispatcher {
       return std::nullopt;
     CallSemantics Result;
     Result.contextEffect = ContextEffect::Preserve;
-    Result.operation =
-        CallSemantics::OperationModel{0, 1, {}, true, {}, {}};
+    CallSemantics::OperationModel Operation;
+    Operation.numberArgument = 0;
+    Operation.firstArgument = 1;
+    Result.operation = std::move(Operation);
     return Result;
   }
 
@@ -1329,6 +1405,7 @@ class SemanticDispatcher {
     Unsigned32,
     Signed64,
     Unsigned64,
+    Integral32,
     Pointer,
   };
 
@@ -1337,6 +1414,15 @@ class SemanticDispatcher {
     Type = Type.getCanonicalType();
     if (Expected == ProfileType::Pointer)
       return Type->isPointerType();
+    if (Expected == ProfileType::Integral32) {
+      if (const auto *Enumeration = Type->getAs<EnumType>()) {
+        QualType Integer = Enumeration->getDecl()->getIntegerType();
+        if (Integer.isNull())
+          return false;
+        Type = Integer.getCanonicalType();
+      }
+      return Type->isIntegerType() && Context.getIntWidth(Type) == 32;
+    }
     bool Signed = Expected == ProfileType::Signed32 ||
                   Expected == ProfileType::Signed64;
     unsigned Width =
@@ -1386,6 +1472,32 @@ class SemanticDispatcher {
       return matchesDeclaration(
           FD, T::Signed32, {T::Signed32, T::Pointer, T::Signed32}, true,
           Context);
+    if (Name == "fcntl")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Signed32, T::Signed32}, true, Context);
+    if (Name == "getpid")
+      return matchesDeclaration(FD, T::Signed32, {}, false, Context);
+    if (Name == "access")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Pointer, T::Signed32}, false, Context);
+    if (Name == "kill")
+      return matchesDeclaration(FD, T::Signed32,
+                                {T::Signed32, T::Signed32}, false, Context);
+    if (Name == "safe_close")
+      return matchesDeclaration(
+          FD, T::Signed32,
+          {T::Pointer, T::Signed32, T::Pointer, T::Signed32}, false, Context);
+    if (Name == "safe_open")
+      return matchesDeclaration(
+          FD, T::Signed32,
+          {T::Pointer, T::Signed32, T::Pointer, T::Pointer, T::Signed32},
+          true, Context);
+    if (Name == "safe_write")
+      return matchesDeclaration(
+          FD, T::Signed64,
+          {T::Pointer, T::Signed32, T::Pointer, T::Integral32, T::Signed32,
+           T::Pointer, T::Unsigned64},
+          false, Context);
     return false;
   }
 
@@ -1404,12 +1516,16 @@ class SemanticDispatcher {
   static CallSemantics fixedOperation(
       llvm::StringRef Name,
       std::vector<CallSemantics::OperationModel::Argument> Arguments = {},
-      std::vector<unsigned> InvalidatedArguments = {}) {
+      std::vector<unsigned> InvalidatedArguments = {},
+      std::optional<ResultConstraint> AcceptedResult = std::nullopt) {
     CallSemantics Result;
     Result.contextEffect = ContextEffect::Preserve;
-    Result.operation = CallSemantics::OperationModel{
-        std::nullopt, 0, Name.str(), true, std::move(Arguments),
-        std::move(InvalidatedArguments)};
+    CallSemantics::OperationModel Operation;
+    Operation.fixedName = Name.str();
+    Operation.arguments = std::move(Arguments);
+    Operation.invalidatedArguments = std::move(InvalidatedArguments);
+    Operation.acceptedResult = std::move(AcceptedResult);
+    Result.operation = std::move(Operation);
     return Result;
   }
 
@@ -1433,6 +1549,11 @@ class SemanticDispatcher {
         {"close", "close", 1, -1, -1},
         {"write", "write", 3, -1, -1},
         {"ioctl", "ioctl", 3, 2, -1},
+        {"fcntl", "fcntl", 3, -1, -1},
+        {"fcntl", "fcntl", 2, -1, -1},
+        {"getpid", "getpid", 0, -1, -1},
+        {"access", "access", 2, -1, -1},
+        {"kill", "kill", 2, -1, -1},
     };
     for (const DirectModel &Model : Direct) {
       if (Name != Model.wrapper || Call.getNumArgs() != Model.argumentCount)
@@ -1448,6 +1569,38 @@ class SemanticDispatcher {
     if (Name == "eventfd" && Call.getNumArgs() == 2)
       return fixedOperation("eventfd2");
     using Argument = CallSemantics::OperationModel::Argument;
+    if (Name == "safe_close" && Call.getNumArgs() == 4)
+      return fixedOperation("close", {Argument::call(3)}, {},
+                            ResultConstraint{"==", 0});
+    if (Name == "safe_write" && Call.getNumArgs() == 7) {
+      const llvm::APSInt *Strict = Call.getArgSVal(3).getAsInteger();
+      if (!Strict || Strict->getBitWidth() > 64)
+        return std::nullopt;
+      int64_t Policy = Strict->getExtValue();
+      std::optional<ResultConstraint> Accepted;
+      if (Policy == 0) {
+        Accepted = ResultConstraint{">=", 0};
+      } else if (Policy == 1) {
+        const llvm::APSInt *Count = Call.getArgSVal(6).getAsInteger();
+        if (!Count || Count->getBitWidth() > 64 ||
+            (Count->isUnsigned() &&
+             Count->getZExtValue() >
+                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max())))
+          return std::nullopt;
+        int64_t Bytes = Count->isUnsigned()
+                            ? static_cast<int64_t>(Count->getZExtValue())
+                            : Count->getSExtValue();
+        Accepted = ResultConstraint{"==", Bytes};
+      } else {
+        /* SAFE_WRITE_RETRY can issue more than one write syscall. */
+        return std::nullopt;
+      }
+      return fixedOperation(
+          "write",
+          {Argument::call(4), Argument::call(5), Argument::call(6)}, {},
+          std::move(Accepted));
+    }
+
     unsigned FlagsIndex;
     unsigned RequiredArguments;
     std::vector<Argument> Arguments;
@@ -1460,6 +1613,11 @@ class SemanticDispatcher {
       FlagsIndex = 2;
       RequiredArguments = 3;
       Arguments = {Argument::call(0), Argument::call(1), Argument::call(2)};
+    } else if (Name == "safe_open" && Call.getNumArgs() >= 5) {
+      FlagsIndex = 4;
+      RequiredArguments = 5;
+      Arguments = {Argument::signedConstant(-100), Argument::call(3),
+                   Argument::call(4)};
     } else {
       return std::nullopt;
     }
@@ -1480,7 +1638,11 @@ class SemanticDispatcher {
        * ignored exactly as in the glibc wrapper. */
       Arguments.push_back(Argument::unsignedConstant(0));
     }
-    return fixedOperation("openat", std::move(Arguments));
+    std::optional<ResultConstraint> Accepted;
+    if (Name == "safe_open")
+      Accepted = ResultConstraint{">=", 0};
+    return fixedOperation("openat", std::move(Arguments), {},
+                          std::move(Accepted));
   }
 
 public:
@@ -1832,25 +1994,37 @@ static bool resourceCastChain(SymbolRef Expression, SymbolRef Atom) {
   return Cast && resourceCastChain(Cast->getOperand(), Atom);
 }
 
-static const Invocation *dependencyProducer(SVal Value, QualType Type,
-                                            ProgramStateRef State,
-                                            ASTContext &Context) {
+struct DependencySource {
+  const Invocation *call = nullptr;
+  int outputArgument = -1;
+};
+
+static std::optional<DependencySource>
+dependencyProducer(SVal Value, QualType Type, ProgramStateRef State,
+                   ASTContext &Context) {
   SymbolRef Expression = Value.getAsSymbol(true);
   if (!Expression)
-    return nullptr;
+    return std::nullopt;
+  if (const OutputOwner *Owner = State->get<OutputOwners>(Expression))
+    return DependencySource{Owner->call, static_cast<int>(Owner->argument)};
+  for (SymbolRef Atom : Value.symbols())
+    if (const OutputOwner *Owner = State->get<OutputOwners>(Atom))
+      return DependencySource{Owner->call, static_cast<int>(Owner->argument)};
   Provenance ValueProvenance = provenanceFromValue(Value, State, Type, Context);
   const Invocation *Producer = nullptr;
   bool Found = false;
   for (const EventOrigin &Origin : ValueProvenance.origins) {
     if (Origin.field != EventField::Result ||
         !resourceCastChain(Expression, Origin.atom))
-      return nullptr;
+      return std::nullopt;
     if (Found && Producer != Origin.call)
-      return nullptr;
+      return std::nullopt;
     Producer = Origin.call;
     Found = true;
   }
-  return Found ? Producer : nullptr;
+  if (!Found)
+    return std::nullopt;
+  return DependencySource{Producer, -1};
 }
 
 static std::string comparisonOperator(BinaryOperatorKind Opcode) {
@@ -2059,7 +2233,9 @@ static bool collectDependencies(const Invocation *Call,
 
 static std::optional<MaterializedArgument>
 materializeArgument(const CapturedArgument &Argument, ProgramStateRef State,
-                    const std::map<const Invocation *, std::string> &Names) {
+                    const std::map<DependencyKey, std::string> &Names,
+                    const Invocation *Owner = nullptr,
+                    unsigned ArgumentIndex = 0) {
   MaterializedArgument Result;
   if (Argument.kind == CapturedArgument::Concrete) {
     Result.kind = MaterializedArgument::Concrete;
@@ -2068,11 +2244,23 @@ materializeArgument(const CapturedArgument &Argument, ProgramStateRef State,
     return Result;
   }
   if (Argument.kind == CapturedArgument::Reference) {
-    auto Name = Names.find(Argument.producer);
+    auto Name = Names.find(
+        DependencyKey{Argument.producer, Argument.producerOutputArgument});
     if (Name == Names.end())
       return std::nullopt;
     Result.kind = MaterializedArgument::Reference;
     Result.reference = Name->second;
+    return Result;
+  }
+  if (Argument.kind == CapturedArgument::Output) {
+    Result.kind = MaterializedArgument::Output;
+    Result.outputSize = Argument.outputSize;
+    auto Name = Names.find(
+        DependencyKey{Owner, static_cast<int>(ArgumentIndex)});
+    if (Name != Names.end())
+      Result.outputBinding = Name->second;
+    if (!Result.outputSize && Result.outputBinding.empty())
+      return std::nullopt;
     return Result;
   }
   if (Argument.kind != CapturedArgument::Symbolic)
@@ -2088,19 +2276,20 @@ materializeArgument(const CapturedArgument &Argument, ProgramStateRef State,
 
 static std::optional<MaterializedCall>
 materializeCall(const Invocation *Call, ProgramStateRef State,
-                const std::map<const Invocation *, std::string> &Names,
+                const std::map<DependencyKey, std::string> &Names,
                 bool Setup) {
   MaterializedCall Result;
   Result.syscall = Call->syscall;
   if (Setup) {
-    auto Name = Names.find(Call);
-    if (Name == Names.end())
-      return std::nullopt;
-    Result.bind = Name->second;
+    auto Name = Names.find(DependencyKey{Call, -1});
+    if (Name != Names.end())
+      Result.bind = Name->second;
     Result.result = constraintsForInvocation(Call, State);
   }
-  for (const CapturedArgument &Argument : Call->args) {
-    auto Materialized = materializeArgument(Argument, State, Names);
+  for (unsigned Index = 0; Index < Call->args.size(); ++Index) {
+    const CapturedArgument &Argument = Call->args[Index];
+    auto Materialized =
+        materializeArgument(Argument, State, Names, Call, Index);
     if (!Materialized)
       return std::nullopt;
     Result.args.push_back(std::move(*Materialized));
@@ -2122,18 +2311,28 @@ materializeScenario(const AssertionMarker *Marker, ConstraintDomains Domains,
     return std::nullopt;
   Ordered.pop_back();
 
-  std::map<const Invocation *, std::string> Names;
+  std::map<DependencyKey, std::string> Names;
   std::set<std::string> UsedNames;
   unsigned Generated = 0;
-  for (const Invocation *Call : Ordered) {
-    std::string Base = ActiveCollector->preferredBinding(Call);
-    if (Base.empty())
-      Base = "dep" + std::to_string(Generated++);
-    std::string Name = Base;
-    for (unsigned Suffix = 2; !UsedNames.insert(Name).second; ++Suffix)
-      Name = Base + "_" + std::to_string(Suffix);
-    Names.emplace(Call, std::move(Name));
-  }
+  auto NameReferences = [&](const Invocation *Call) {
+    for (const CapturedArgument &Argument : Call->args) {
+      if (Argument.kind != CapturedArgument::Reference)
+        continue;
+      DependencyKey Key{Argument.producer, Argument.producerOutputArgument};
+      if (Names.count(Key))
+        continue;
+      std::string Base = ActiveCollector->preferredBinding(Key);
+      if (Base.empty())
+        Base = "dep" + std::to_string(Generated++);
+      std::string Name = Base;
+      for (unsigned Suffix = 2; !UsedNames.insert(Name).second; ++Suffix)
+        Name = Base + "_" + std::to_string(Suffix);
+      Names.emplace(Key, std::move(Name));
+    }
+  };
+  for (const Invocation *Call : Ordered)
+    NameReferences(Call);
+  NameReferences(Target);
 
   ScenarioObservation Result;
   Result.function = Target->function;
@@ -2174,6 +2373,180 @@ static bool modelableOperation(const CallEvent &Call,
   const llvm::APSInt *Number =
       Call.getArgSVal(*Operation.numberArgument).getAsInteger();
   return Number && Number->getBitWidth() <= 64;
+}
+
+struct OutputArgumentModel {
+  bool storesScalar = false;
+};
+
+static std::optional<OutputArgumentModel>
+outputArgumentModel(llvm::StringRef Syscall, const CallEvent &Call,
+                    unsigned Index) {
+  struct Rule {
+    llvm::StringLiteral syscall;
+    unsigned argument;
+    int selectorArgument;
+    int64_t selectorValue;
+    bool storesScalar;
+  };
+  /* Indices are call-expression indices, including syscall(2)'s number at 0.
+   * A selector of -1 makes the direction unconditional. */
+  static constexpr Rule Rules[] = {
+      {"timer_create", 3, -1, 0, true},
+      {"sysfs", 3, 1, 2, false},
+  };
+  for (const Rule &Candidate : Rules) {
+    if (Syscall != Candidate.syscall || Index != Candidate.argument)
+      continue;
+    if (Candidate.selectorArgument >= 0) {
+      unsigned Selector = static_cast<unsigned>(Candidate.selectorArgument);
+      if (Selector >= Call.getNumArgs())
+        continue;
+      const llvm::APSInt *Value = Call.getArgSVal(Selector).getAsInteger();
+      if (!Value || Value->getBitWidth() > 64 ||
+          Value->getExtValue() != Candidate.selectorValue)
+        continue;
+    }
+    return OutputArgumentModel{Candidate.storesScalar};
+  }
+  return std::nullopt;
+}
+
+static std::optional<uint64_t> outputObjectSize(const Expr *Expression,
+                                                ASTContext &Context) {
+  Expression = ignoreExpr(Expression);
+  if (!Expression)
+    return std::nullopt;
+  QualType Type = Expression->getType();
+  if (!Context.getAsConstantArrayType(Type))
+    return std::nullopt;
+  CharUnits Size = Context.getTypeSizeInChars(Type);
+  if (Size.isNegative())
+    return std::nullopt;
+  return static_cast<uint64_t>(Size.getQuantity());
+}
+
+static const InitListExpr *semanticInitializers(const Expr *Expression) {
+  auto *Initializers =
+      dyn_cast_or_null<InitListExpr>(ignoreExpr(Expression));
+  if (!Initializers)
+    return nullptr;
+  if (!Initializers->isSemanticForm())
+    Initializers = Initializers->getSemanticForm();
+  return Initializers;
+}
+
+static std::optional<ConcreteValue>
+constantInitializerValue(const Expr *Expression, ASTContext &Context) {
+  Expression = ignoreExpr(Expression);
+  if (!Expression)
+    return std::nullopt;
+  if (const auto *Literal = dyn_cast<StringLiteral>(Expression))
+    return ConcreteValue::string(Literal->getString().str());
+  Expr::EvalResult Evaluated;
+  if (!Expression->EvaluateAsInt(Evaluated, Context))
+    return std::nullopt;
+  const llvm::APSInt &Integer = Evaluated.Val.getInt();
+  if (Integer.getBitWidth() > 64)
+    return std::nullopt;
+  uint64_t Bits = Integer.isUnsigned()
+                      ? Integer.getZExtValue()
+                      : static_cast<uint64_t>(Integer.getSExtValue());
+  return ConcreteValue::integer(Bits, Integer.isUnsigned());
+}
+
+static std::optional<ConcreteValue>
+snapshotHarnessArgument(const Expr *Expression, unsigned Case,
+                        const ParmVarDecl *HarnessIndex,
+                        ASTContext &Context) {
+  Expression = ignoreExpr(Expression);
+  const FieldDecl *Field = nullptr;
+  if (const auto *Member = dyn_cast_or_null<MemberExpr>(Expression)) {
+    Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+    Expression = ignoreExpr(Member->getBase());
+  }
+  const auto *Subscript = dyn_cast_or_null<ArraySubscriptExpr>(Expression);
+  const auto *IndexReference = Subscript ? dyn_cast_or_null<DeclRefExpr>(
+                                               ignoreExpr(Subscript->getIdx()))
+                                         : nullptr;
+  if (!Subscript || !IndexReference || !HarnessIndex ||
+      IndexReference->getDecl()->getCanonicalDecl() !=
+          HarnessIndex->getCanonicalDecl())
+    return std::nullopt;
+  const auto *ArrayReference =
+      dyn_cast_or_null<DeclRefExpr>(ignoreExpr(Subscript->getBase()));
+  const auto *Array =
+      ArrayReference ? dyn_cast<VarDecl>(ArrayReference->getDecl()) : nullptr;
+  if (!Array || !Array->hasGlobalStorage() || !Array->hasInit())
+    return std::nullopt;
+  const InitListExpr *ArrayValues = semanticInitializers(Array->getInit());
+  if (!ArrayValues || Case >= ArrayValues->getNumInits())
+    return std::nullopt;
+  const Expr *Value = ArrayValues->getInit(Case);
+  if (Field) {
+    const InitListExpr *Fields = semanticInitializers(Value);
+    if (!Fields)
+      return std::nullopt;
+    unsigned Index = 0;
+    bool Found = false;
+    for (const FieldDecl *Candidate : Field->getParent()->fields()) {
+      if (Candidate->getCanonicalDecl() == Field->getCanonicalDecl()) {
+        Found = true;
+        break;
+      }
+      ++Index;
+    }
+    if (!Found || Index >= Fields->getNumInits())
+      return std::nullopt;
+    Value = Fields->getInit(Index);
+  }
+  return constantInitializerValue(Value, Context);
+}
+
+static std::optional<IntegerDomain>
+domainForAcceptedResult(const ResultConstraint &Constraint) {
+  constexpr int64_t Min = std::numeric_limits<int64_t>::min();
+  constexpr int64_t Max = std::numeric_limits<int64_t>::max();
+  int64_t Value = Constraint.value;
+  if (Constraint.op == "==")
+    return IntegerDomain{{{Value, Value}}};
+  if (Constraint.op == ">=")
+    return IntegerDomain{{{Value, Max}}};
+  if (Constraint.op == ">" && Value != Max)
+    return IntegerDomain{{{Value + 1, Max}}};
+  if (Constraint.op == "<=")
+    return IntegerDomain{{{Min, Value}}};
+  if (Constraint.op == "<" && Value != Min)
+    return IntegerDomain{{{Min, Value - 1}}};
+  if (Constraint.op == "!=" && Value != Min && Value != Max)
+    return IntegerDomain{{{Min, Value - 1}, {Value + 1, Max}}};
+  return std::nullopt;
+}
+
+static ProgramStateRef
+assumeAcceptedResult(ProgramStateRef State, SVal Result, QualType Type,
+                     const ResultConstraint &Constraint, CheckerContext &C) {
+  BinaryOperatorKind Opcode;
+  if (Constraint.op == "==")
+    Opcode = BO_EQ;
+  else if (Constraint.op == "!=")
+    Opcode = BO_NE;
+  else if (Constraint.op == ">=")
+    Opcode = BO_GE;
+  else if (Constraint.op == ">")
+    Opcode = BO_GT;
+  else if (Constraint.op == "<=")
+    Opcode = BO_LE;
+  else if (Constraint.op == "<")
+    Opcode = BO_LT;
+  else
+    return State;
+  DefinedSVal Constant = C.getSValBuilder().makeIntVal(
+      static_cast<uint64_t>(Constraint.value), Type);
+  SVal Predicate = C.getSValBuilder().evalBinOp(
+      State, Opcode, Result, Constant, C.getASTContext().BoolTy);
+  auto Condition = Predicate.getAs<DefinedOrUnknownSVal>();
+  return Condition ? State->assume(*Condition, true) : State;
 }
 
 class SyscallScenarioChecker
@@ -2616,6 +2989,8 @@ public:
     };
     for (const auto &Entry : State->get<SymbolOwners>())
       Reaper.markLive(Entry.first);
+    for (const auto &Entry : State->get<OutputOwners>())
+      Reaper.markLive(Entry.first);
     for (const auto &Entry : State->get<ProvenanceBySymbol>()) {
       Reaper.markLive(Entry.first);
       MarkProvenance(Entry.second);
@@ -2719,6 +3094,12 @@ public:
       Value.syscall = Operation.fixedName;
     }
     Value.eventSite = Call.getOriginExpr();
+    struct CapturedOutput {
+      unsigned callIndex;
+      unsigned capturedIndex;
+      bool storesScalar;
+    };
+    std::vector<CapturedOutput> OutputArguments;
     auto CaptureArgument = [&](unsigned I) {
       SVal ArgumentValue = Call.getArgSVal(I);
       QualType ArgumentType = Call.getArgExpr(I)->getType();
@@ -2726,10 +3107,31 @@ public:
           dyn_cast_or_null<DeclRefExpr>(ignoreExpr(Call.getArgExpr(I)));
       const ValueDecl *SourceDecl =
           ArgumentRef ? ArgumentRef->getDecl() : nullptr;
-      if (const Invocation *Producer = dependencyProducer(
+      if (auto Producer = dependencyProducer(
               ArgumentValue, ArgumentType, C.getState(), C.getASTContext())) {
-        return CapturedArgument::reference(Producer);
+        if (Producer->outputArgument >= 0 && SourceDecl)
+          ActiveCollector->noteOutputBinding(
+              Producer->call, static_cast<unsigned>(Producer->outputArgument),
+              SourceDecl->getName());
+        return CapturedArgument::reference(Producer->call,
+                                           Producer->outputArgument);
       }
+      if (outputArgumentModel(Value.syscall, Call, I))
+        return CapturedArgument::output(
+            outputObjectSize(Call.getArgExpr(I), C.getASTContext()));
+      unsigned HarnessCase = C.getState()->get<CurrentHarnessCase>();
+      const FunctionDecl *HarnessFunction =
+          topFunction(C.getLocationContext());
+      const ParmVarDecl *HarnessIndex =
+          HarnessFunction && HarnessFunction->getNumParams() == 1
+              ? HarnessFunction->getParamDecl(0)
+              : nullptr;
+      if (HarnessCase && HarnessIndex)
+        if (auto Concrete = snapshotHarnessArgument(
+                Call.getArgExpr(I), HarnessCase - 1, HarnessIndex,
+                C.getASTContext()))
+          return CapturedArgument::concreteValue(std::move(*Concrete),
+                                                 SourceDecl);
       if (auto Concrete = snapshotValue(ArgumentValue, ArgumentType,
                                         C.getState(), C.getLocationContext())) {
         return CapturedArgument::concreteValue(std::move(*Concrete),
@@ -2746,13 +3148,28 @@ public:
       return CapturedArgument{};
     };
     if (Operation.arguments.empty()) {
-      for (unsigned I = Operation.firstArgument; I < Call.getNumArgs(); ++I)
+      for (unsigned I = Operation.firstArgument; I < Call.getNumArgs(); ++I) {
+        unsigned CapturedIndex = Value.args.size();
         Value.args.push_back(CaptureArgument(I));
+        if (Value.args.back().kind == CapturedArgument::Output) {
+          auto Model = outputArgumentModel(Value.syscall, Call, I);
+          OutputArguments.push_back({I, CapturedIndex,
+                                     Model && Model->storesScalar});
+        }
+      }
     } else {
       using Argument = CallSemantics::OperationModel::Argument;
       for (const Argument &Model : Operation.arguments) {
         if (Model.kind == Argument::CallArgument) {
+          unsigned CapturedIndex = Value.args.size();
           Value.args.push_back(CaptureArgument(Model.index));
+          if (Value.args.back().kind == CapturedArgument::Output) {
+            auto Output =
+                outputArgumentModel(Value.syscall, Call, Model.index);
+            OutputArguments.push_back(
+                {Model.index, CapturedIndex,
+                 Output && Output->storesScalar});
+          }
         } else {
           Value.args.push_back(CapturedArgument::concreteValue(
               ConcreteValue::integer(Model.value,
@@ -2774,10 +3191,22 @@ public:
     const Invocation *Stored =
         ActiveCollector->makeInvocation(std::move(Value));
     ProgramStateRef State = C.getState();
-    if (!Operation.invalidatedArguments.empty()) {
+    if (Operation.acceptedResult) {
+      State = assumeAcceptedResult(State, Return, Call.getResultType(),
+                                   *Operation.acceptedResult, C);
+      if (!State)
+        return true;
+    }
+    std::vector<unsigned> InvalidatedArguments =
+        Operation.invalidatedArguments;
+    for (const CapturedOutput &Output : OutputArguments)
+      if (std::find(InvalidatedArguments.begin(), InvalidatedArguments.end(),
+                    Output.callIndex) == InvalidatedArguments.end())
+        InvalidatedArguments.push_back(Output.callIndex);
+    if (!InvalidatedArguments.empty()) {
       std::vector<SVal> Values;
-      Values.reserve(Operation.invalidatedArguments.size());
-      for (unsigned Index : Operation.invalidatedArguments) {
+      Values.reserve(InvalidatedArguments.size());
+      for (unsigned Index : InvalidatedArguments) {
         SVal Argument = Call.getArgSVal(Index);
         Values.push_back(Argument);
         if (const MemRegion *Region = Argument.getAsRegion())
@@ -2786,6 +3215,24 @@ public:
       State = State->invalidateRegions(
           Values, C.getCFGElementRef(), C.blockCount(), C.getLocationContext(),
           false, nullptr, &Call);
+    }
+    for (const CapturedOutput &Captured : OutputArguments) {
+      if (!Captured.storesScalar)
+        continue;
+      SVal Location = Call.getArgSVal(Captured.callIndex);
+      QualType PointerType = Call.getArgExpr(Captured.callIndex)->getType();
+      if (!PointerType->isPointerType() ||
+          !PointerType->getPointeeType()->isIntegerType())
+        continue;
+      SVal Output = C.getSValBuilder().conjureSymbolVal(
+          Call, PointerType->getPointeeType(), C.blockCount(),
+          &OutputSymbolTag);
+      SymbolRef Symbol = Output.getAsSymbol();
+      if (!Symbol)
+        continue;
+      State = State->bindLoc(Location, Output, C.getLocationContext());
+      State = State->set<OutputOwners>(
+          Symbol, OutputOwner{Stored, Captured.capturedIndex});
     }
     State = State->BindExpr(Call.getOriginExpr(), C.getLocationContext(),
                             Return);
@@ -2804,6 +3251,18 @@ public:
     }
     if (Stored->errnoSymbol)
       State = State->set<CurrentErrnoOwner>(Stored);
+    if (Operation.acceptedResult) {
+      if (auto Domain = domainForAcceptedResult(*Operation.acceptedResult)) {
+        const AssertionMarker *Marker = ActiveCollector->makeAssertionMarker(
+            {Call.getOriginExpr(), Stored, {},
+             State->get<CurrentOutcomeEpoch>(), 0, true});
+        ConstraintDomains Domains;
+        Domains.ret = std::move(*Domain);
+        if (auto Scenario =
+                materializeScenario(Marker, std::move(Domains), State))
+          ActiveCollector->observe(Marker, std::move(*Scenario));
+      }
+    }
     C.addTransition(State);
     return true;
   }
@@ -2917,6 +3376,25 @@ public:
     if (!C.inTopFrame() || !ActiveCollector)
       return;
     ActiveCollector->seeFunction(functionName(C.getLocationContext()));
+    const FunctionDecl *Function = topFunction(C.getLocationContext());
+    if (!Function)
+      return;
+    auto Harness =
+        LtpHarnessCaseCounts.find(Function->getCanonicalDecl());
+    if (Harness == LtpHarnessCaseCounts.end() || Function->getNumParams() != 1)
+      return;
+    const ParmVarDecl *Index = Function->getParamDecl(0);
+    if (!Index->getType()->isIntegerType())
+      return;
+    ProgramStateRef State = C.getState();
+    Loc Location = State->getLValue(Index, C.getLocationContext());
+    for (unsigned Case = 0; Case < Harness->second; ++Case) {
+      DefinedSVal Constant =
+          C.getSValBuilder().makeIntVal(Case, Index->getType());
+      C.addTransition(
+          State->bindLoc(Location, Constant, C.getLocationContext())
+              ->set<CurrentHarnessCase>(Case + 1));
+    }
   }
 
   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
@@ -2935,6 +3413,89 @@ public:
   }
 };
 
+class LtpHarnessVisitor : public RecursiveASTVisitor<LtpHarnessVisitor> {
+  ASTContext &Context;
+
+  static const FunctionDecl *functionInitializer(const Expr *Expression) {
+    Expression = ignoreExpr(Expression);
+    if (const auto *Address = dyn_cast_or_null<UnaryOperator>(Expression))
+      if (Address->getOpcode() == UO_AddrOf)
+        Expression = ignoreExpr(Address->getSubExpr());
+    const auto *Reference = dyn_cast_or_null<DeclRefExpr>(Expression);
+    return Reference ? dyn_cast<FunctionDecl>(Reference->getDecl()) : nullptr;
+  }
+
+public:
+  explicit LtpHarnessVisitor(ASTContext &Context) : Context(Context) {}
+
+  bool VisitVarDecl(VarDecl *Variable) {
+    if (!Variable->hasGlobalStorage() || !Variable->hasInit())
+      return true;
+    const auto *RT = Variable->getType()->getAs<RecordType>();
+    const RecordDecl *Record = RT ? RT->getDecl() : nullptr;
+    if (!Record || Record->getName() != "tst_test")
+      return true;
+    auto *Initializers =
+        dyn_cast_or_null<InitListExpr>(ignoreExpr(Variable->getInit()));
+    if (!Initializers)
+      return true;
+    if (!Initializers->isSemanticForm())
+      Initializers = Initializers->getSemanticForm();
+    if (!Initializers)
+      return true;
+
+    const Expr *CountExpression = nullptr;
+    const Expr *FunctionExpression = nullptr;
+    unsigned FieldIndex = 0;
+    for (const FieldDecl *Field : Record->fields()) {
+      const Expr *Initializer = FieldIndex < Initializers->getNumInits()
+                                    ? Initializers->getInit(FieldIndex)
+                                    : nullptr;
+      if (Field->getName() == "tcnt")
+        CountExpression = Initializer;
+      else if (Field->getName() == "test")
+        FunctionExpression = Initializer;
+      ++FieldIndex;
+    }
+    if (!CountExpression || !FunctionExpression)
+      return true;
+    Expr::EvalResult Evaluated;
+    if (!CountExpression->EvaluateAsInt(Evaluated, Context))
+      return true;
+    const llvm::APSInt &Count = Evaluated.Val.getInt();
+    if (Count.isNegative() || Count.getActiveBits() > 32)
+      return true;
+    uint64_t Cases = Count.getZExtValue();
+    /* Keep accidental or malformed descriptors from causing path explosion. */
+    if (Cases == 0 || Cases > 256)
+      return true;
+    const FunctionDecl *Function = functionInitializer(FunctionExpression);
+    if (!Function || Function->getNumParams() != 1)
+      return true;
+    LtpHarnessCaseCounts[Function->getCanonicalDecl()] =
+        static_cast<unsigned>(Cases);
+    return true;
+  }
+};
+
+class LtpHarnessConsumer : public ASTConsumer {
+public:
+  bool HandleTopLevelDecl(DeclGroupRef Declarations) override {
+    if (Declarations.isNull())
+      return true;
+    ASTContext &Context = (*Declarations.begin())->getASTContext();
+    LtpHarnessVisitor Visitor(Context);
+    for (Decl *Declaration : Declarations)
+      Visitor.TraverseDecl(Declaration);
+    return true;
+  }
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    LtpHarnessVisitor Visitor(Context);
+    Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+  }
+};
+
 class AnalyzerAction : public ASTFrontendAction {
 protected:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
@@ -2945,12 +3506,16 @@ protected:
     if (!AllFunctions && Functions.size() == 1)
       Options.AnalyzeSpecificFunction = Functions.front();
     Options.CheckersAndPackages.emplace_back("extractor.SyscallScenario", true);
-    auto Consumer = CreateAnalysisConsumer(CI);
-    Consumer->AddCheckerRegistrationFn([](CheckerRegistry &Registry) {
+    auto Analysis = CreateAnalysisConsumer(CI);
+    Analysis->AddCheckerRegistrationFn([](CheckerRegistry &Registry) {
       Registry.addChecker<SyscallScenarioChecker>(
           "extractor.SyscallScenario", "Extract syscall scenarios", "", false);
     });
-    return Consumer;
+    LtpHarnessCaseCounts.clear();
+    std::vector<std::unique_ptr<ASTConsumer>> Consumers;
+    Consumers.push_back(std::make_unique<LtpHarnessConsumer>());
+    Consumers.push_back(std::move(Analysis));
+    return std::make_unique<MultiplexConsumer>(std::move(Consumers));
   }
 };
 
