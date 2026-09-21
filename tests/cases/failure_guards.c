@@ -9,6 +9,7 @@ extern long syscall(long number, ...);
 extern void ksft_exit_fail_msg(const char *format, ...)
     __attribute__((noreturn));
 extern void abort(void) __attribute__((noreturn));
+extern void test__fail(void);
 
 static void ksft_failure_guard(void) {
   long result = syscall(__NR_pidfd_getfd, 201, 20, 0);
@@ -26,8 +27,10 @@ static void abort_failure_guard(void) {
 
 static int failure_return_guard(void) {
   long result = syscall(__NR_pidfd_getfd, 203, 22, 0);
-  if (result != 0)
+  if (result != 0) {
+    test__fail();
     return KSFT_FAIL;
+  }
   return 0;
 }
 

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -17,6 +18,7 @@
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/Stmt.h>
 #include <clang/Analysis/CFG.h>
 #include <clang/Basic/SourceManager.h>
@@ -436,7 +438,9 @@ struct AssertionMarker {
   const Expr *site = nullptr;
   const Invocation *call = nullptr;
   std::vector<ProjectionSubject> projections;
-  bool explicitAssertion = false;
+  unsigned epoch = 0;
+  unsigned sequence = 0;
+  bool outcomeAttributed = false;
 };
 
 struct ComparisonHint {
@@ -480,10 +484,11 @@ class Collector {
   struct ObservationGroup {
     const Expr *assertionSite = nullptr;
     const Expr *eventSite = nullptr;
+    unsigned epoch = 0;
     std::string function;
     std::string syscall;
     std::vector<ScenarioObservation> alternatives;
-    bool explicitAssertion = false;
+    bool outcomeAttributed = false;
     bool failureSeen = false;
     bool skipSeen = false;
   };
@@ -921,21 +926,23 @@ public:
                      [&](const ObservationGroup &Candidate) {
                        return Candidate.assertionSite == Marker->site &&
                               Candidate.eventSite == Call->eventSite &&
+                              Candidate.epoch == Marker->epoch &&
                               Candidate.function == Call->function &&
                               Candidate.syscall == Call->syscall;
                      });
     if (Group == ObservationGroups.end()) {
       ObservationGroups.push_back({Marker->site,
                                    Call->eventSite,
+                                   Marker->epoch,
                                    Call->function,
                                    Call->syscall,
                                    {},
-                                   Marker->explicitAssertion,
+                                   Marker->outcomeAttributed,
                                    false,
                                    false});
       return &ObservationGroups.back();
     }
-    Group->explicitAssertion |= Marker->explicitAssertion;
+    Group->outcomeAttributed |= Marker->outcomeAttributed;
     return &*Group;
   }
 
@@ -963,25 +970,29 @@ public:
     std::vector<ScenarioObservation> Scenarios;
     for (ObservationGroup &Group : ObservationGroups) {
       if (Group.skipSeen ||
-          (!Group.explicitAssertion && !Group.failureSeen) ||
+          (!Group.outcomeAttributed && !Group.failureSeen) ||
           Group.alternatives.empty())
         continue;
-      Scenarios.insert(Scenarios.end(), Group.alternatives.begin(),
-                       Group.alternatives.end());
-    }
-    bool Changed;
-    do {
-      Changed = false;
-      for (size_t I = 0; I < Scenarios.size() && !Changed; ++I) {
-        for (size_t J = I + 1; J < Scenarios.size(); ++J) {
-          if (!tryMerge(Scenarios[I], Scenarios[J]))
-            continue;
-          Scenarios.erase(Scenarios.begin() + static_cast<std::ptrdiff_t>(J));
-          Changed = true;
-          break;
+      std::vector<ScenarioObservation> Alternatives =
+          std::move(Group.alternatives);
+      bool Changed;
+      do {
+        Changed = false;
+        for (size_t I = 0; I < Alternatives.size() && !Changed; ++I) {
+          for (size_t J = I + 1; J < Alternatives.size(); ++J) {
+            if (!tryMerge(Alternatives[I], Alternatives[J]))
+              continue;
+            Alternatives.erase(Alternatives.begin() +
+                               static_cast<std::ptrdiff_t>(J));
+            Changed = true;
+            break;
+          }
         }
-      }
-    } while (Changed);
+      } while (Changed);
+      Scenarios.insert(Scenarios.end(),
+                       std::make_move_iterator(Alternatives.begin()),
+                       std::make_move_iterator(Alternatives.end()));
+    }
     for (const ScenarioObservation &Scenario : Scenarios)
       appendRecord(Scenario);
     Finalized = true;
@@ -1031,9 +1042,12 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ComparisonHintByEvaluationSite, EvaluationSite,
 REGISTER_MAP_WITH_PROGRAMSTATE(ProvenanceByRegion, const MemRegion *,
                                const Provenance *)
 REGISTER_SET_WITH_PROGRAMSTATE(TrackedArgumentSymbols, SymbolRef)
-REGISTER_SET_WITH_PROGRAMSTATE(PendingAssertions, const AssertionMarker *)
 REGISTER_SET_WITH_PROGRAMSTATE(ActiveGuards, const AssertionMarker *)
 REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentErrnoOwner, const Invocation *)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(CurrentOutcomeEpoch, unsigned)
+REGISTER_TRAIT_WITH_PROGRAMSTATE(NextOutcomeCandidate, unsigned)
+/* 0 is unset/pass-by-default; other values are encoded PathOutcome + 1. */
+REGISTER_TRAIT_WITH_PROGRAMSTATE(FrameworkStatus, unsigned)
 
 static const FunctionDecl *topFunction(const LocationContext *LC) {
   while (LC && LC->getParent())
@@ -1131,12 +1145,6 @@ static bool namedCall(const CallEvent &Call, llvm::StringRef Name) {
 
 enum class SemanticCallKind : uint8_t {
   Unknown,
-  BooleanAssertion,
-  SyscallEqualAssertion,
-  SyscallZeroAssertion,
-  SyscallErrorAssertion,
-  Failure,
-  KsftOutcome,
   KsftResultCode,
   LtpReporter,
   LtpErrnoSet,
@@ -1156,11 +1164,29 @@ enum class PathOutcome : uint8_t {
   Neutral,
 };
 
+enum class OutcomeAction : uint8_t {
+  ReportBoundary,
+  CounterUpdate,
+  StatusWrite,
+  Terminate,
+};
+
+enum class OutcomeScope : uint8_t {
+  ActiveCandidates,
+  InnermostCandidates,
+  Epoch,
+};
+
+struct OutcomeEffect {
+  PathOutcome verdict = PathOutcome::Neutral;
+  OutcomeAction action = OutcomeAction::ReportBoundary;
+  OutcomeScope scope = OutcomeScope::Epoch;
+};
+
 struct CallSemantics {
   SemanticCallKind kind = SemanticCallKind::Unknown;
   ContextEffect contextEffect = ContextEffect::Default;
-  std::optional<PathOutcome> outcome;
-  bool terminal = false;
+  std::optional<OutcomeEffect> outcome;
   struct OperationModel {
     struct Argument {
       enum Kind : uint8_t { CallArgument, SignedConstant, UnsignedConstant };
@@ -1201,10 +1227,11 @@ class SemanticDispatcher {
     return Result;
   }
 
-  static CallSemantics ksftOutcome(PathOutcome Outcome, bool Terminal) {
-    CallSemantics Result = action(SemanticCallKind::KsftOutcome);
-    Result.outcome = Outcome;
-    Result.terminal = Terminal;
+  static CallSemantics outcome(PathOutcome Verdict, OutcomeAction Action,
+                               OutcomeScope Scope = OutcomeScope::Epoch) {
+    CallSemantics Result;
+    Result.contextEffect = ContextEffect::Preserve;
+    Result.outcome = OutcomeEffect{Verdict, Action, Scope};
     return Result;
   }
 
@@ -1219,8 +1246,16 @@ class SemanticDispatcher {
   }
 
   static std::optional<CallSemantics> commonAdapter(llvm::StringRef Name) {
-    if (Name == "abort" || Name == "__assert_fail" || Name == "test__fail")
-      return action(SemanticCallKind::Failure);
+    if (Name == "abort" || Name == "__assert_fail")
+      return outcome(PathOutcome::Fail, OutcomeAction::Terminate,
+                     OutcomeScope::ActiveCandidates);
+    if (Name == "test__fail")
+      return outcome(PathOutcome::Fail, OutcomeAction::StatusWrite,
+                     OutcomeScope::InnermostCandidates);
+    if (Name == "test__report_pass")
+      return outcome(PathOutcome::Pass, OutcomeAction::ReportBoundary);
+    if (Name == "test__report_fail")
+      return outcome(PathOutcome::Fail, OutcomeAction::ReportBoundary);
     if (Name == "__errno_location" || Name == "fprintf" || Name == "printf" ||
         Name == "snprintf" || Name == "puts" || Name == "fputs")
       return action(SemanticCallKind::Preserve);
@@ -1228,47 +1263,48 @@ class SemanticDispatcher {
   }
 
   static std::optional<CallSemantics> ksftAdapter(llvm::StringRef Name) {
-    if (Name == "ksft_test_result")
-      return action(SemanticCallKind::BooleanAssertion);
     if (Name == "ksft_test_result_code")
       return action(SemanticCallKind::KsftResultCode);
-    if (Name == "ksft_test_result_pass" || Name == "ksft_inc_pass_cnt")
-      return ksftOutcome(PathOutcome::Pass, false);
+    if (Name == "ksft_test_result_pass")
+      return outcome(PathOutcome::Pass, OutcomeAction::ReportBoundary);
     if (Name == "ksft_test_result_fail" ||
-        Name == "ksft_test_result_error" || Name == "ksft_inc_fail_cnt" ||
-        Name == "ksft_inc_error_cnt")
-      return ksftOutcome(PathOutcome::Fail, false);
+        Name == "ksft_test_result_error")
+      return outcome(PathOutcome::Fail, OutcomeAction::ReportBoundary);
     if (Name == "ksft_test_result_skip" ||
-        Name == "ksft_test_result_xfail" ||
-        Name == "ksft_test_result_xpass" || Name == "ksft_inc_xskip_cnt" ||
-        Name == "ksft_inc_xfail_cnt" || Name == "ksft_inc_xpass_cnt")
-      return ksftOutcome(PathOutcome::Skip, false);
+        Name == "ksft_test_result_xfail" || Name == "ksft_test_result_xpass")
+      return outcome(PathOutcome::Skip, OutcomeAction::ReportBoundary);
+    if (Name == "ksft_inc_pass_cnt")
+      return outcome(PathOutcome::Pass, OutcomeAction::CounterUpdate);
+    if (Name == "ksft_inc_fail_cnt" || Name == "ksft_inc_error_cnt")
+      return outcome(PathOutcome::Fail, OutcomeAction::CounterUpdate);
+    if (Name == "ksft_inc_xskip_cnt" || Name == "ksft_inc_xfail_cnt" ||
+        Name == "ksft_inc_xpass_cnt")
+      return outcome(PathOutcome::Skip, OutcomeAction::CounterUpdate);
     if (Name == "ksft_exit_pass")
-      return ksftOutcome(PathOutcome::Pass, true);
+      return outcome(PathOutcome::Pass, OutcomeAction::Terminate,
+                     OutcomeScope::InnermostCandidates);
     if (Name == "ksft_exit_fail" || Name == "ksft_exit_fail_msg" ||
         Name == "ksft_exit_fail_perror")
-      return ksftOutcome(PathOutcome::Fail, true);
+      return outcome(PathOutcome::Fail, OutcomeAction::Terminate,
+                     OutcomeScope::InnermostCandidates);
     if (Name == "ksft_exit_skip" || Name == "ksft_exit_xfail" ||
         Name == "ksft_exit_xpass")
-      return ksftOutcome(PathOutcome::Skip, true);
+      return outcome(PathOutcome::Skip, OutcomeAction::Terminate,
+                     OutcomeScope::InnermostCandidates);
     return std::nullopt;
   }
 
   static std::optional<CallSemantics> bpfAdapter(llvm::StringRef Name) {
     if (Name == "bpf_test_failure")
-      return action(SemanticCallKind::Failure);
+      return outcome(PathOutcome::Fail, OutcomeAction::StatusWrite,
+                     OutcomeScope::InnermostCandidates);
     return std::nullopt;
   }
 
   static std::optional<CallSemantics> nolibcAdapter(llvm::StringRef Name) {
-    if (Name == "expect_syseq")
-      return action(SemanticCallKind::SyscallEqualAssertion);
-    if (Name == "expect_syszr")
-      return action(SemanticCallKind::SyscallZeroAssertion);
-    if (Name == "expect_syserr")
-      return action(SemanticCallKind::SyscallErrorAssertion);
     if (Name == "nolibc_test_failure")
-      return action(SemanticCallKind::Failure);
+      return outcome(PathOutcome::Fail, OutcomeAction::StatusWrite,
+                     OutcomeScope::InnermostCandidates);
     return std::nullopt;
   }
 
@@ -2115,55 +2151,6 @@ materializeScenario(const AssertionMarker *Marker, ConstraintDomains Domains,
   return Result;
 }
 
-/* Return the truth value of the expanded branch condition on a successful
- * assertion path.  Harness EXPECT/ASSERT macros branch when their predicate
- * fails, whereas the non-harness ksft_test_result and ksft_exit macros branch
- * when their predicate succeeds. */
-static std::optional<bool> assertionExpectedAt(SourceLocation Location,
-                                               CheckerContext &C) {
-  const SourceManager &SM = C.getSourceManager();
-  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
-    llvm::StringRef Name =
-        Lexer::getImmediateMacroName(Location, SM, C.getLangOpts());
-    if (Name == "EXPECT_SYSEQ" || Name == "EXPECT_SYSZR" ||
-        Name == "EXPECT_SYSER")
-      return std::nullopt;
-    if (Name == "ksft_test_result" || Name == "ksft_exit")
-      return true;
-    if (Name == "CHECK_OP" || Name.starts_with("EXPECT_") ||
-        Name.starts_with("ASSERT_"))
-      return false;
-    Location = SM.getImmediateMacroCallerLoc(Location);
-  }
-  return std::nullopt;
-}
-
-static bool failureMacroAt(SourceLocation Location, CheckerContext &C) {
-  const SourceManager &SM = C.getSourceManager();
-  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
-    if (Lexer::getImmediateMacroName(Location, SM, C.getLangOpts()) ==
-        "KSFT_FAIL")
-      return true;
-    Location = SM.getImmediateMacroCallerLoc(Location);
-  }
-  return false;
-}
-
-static bool skipMacroAt(SourceLocation Location, CheckerContext &C) {
-  const SourceManager &SM = C.getSourceManager();
-  for (unsigned Depth = 0; Location.isMacroID() && Depth < 16; ++Depth) {
-    if (Lexer::getImmediateMacroName(Location, SM, C.getLangOpts()) == "SKIP")
-      return true;
-    Location = SM.getImmediateMacroCallerLoc(Location);
-  }
-  return false;
-}
-
-static bool knownFailureReturn(const ReturnStmt *Return, CheckerContext &C) {
-  return Return && Return->getRetValue() &&
-         failureMacroAt(Return->getRetValue()->getExprLoc(), C);
-}
-
 static bool modelableOperation(const CallEvent &Call,
                                const CallSemantics &Semantics,
                                CheckerContext &C) {
@@ -2192,9 +2179,8 @@ static bool modelableOperation(const CallEvent &Call,
 class SyscallScenarioChecker
     : public Checker<
           eval::Call, check::PreCall, check::Bind, check::LiveSymbols,
-          check::RegionChanges, check::PreStmt<ReturnStmt>,
-          check::PreStmt<GotoStmt>,
-          check::PostStmt<ImplicitCastExpr>, check::PostStmt<BinaryOperator>,
+          check::RegionChanges, check::PostStmt<ImplicitCastExpr>,
+          check::PostStmt<BinaryOperator>,
           check::BeginFunction, check::EndFunction, check::BranchCondition> {
   static const Expr *fallbackBindingSource(const MemRegion *Region,
                                            const Stmt *Statement) {
@@ -2219,112 +2205,52 @@ class SyscallScenarioChecker
 
   static ProgramStateRef addMarkers(ProgramStateRef State, const Expr *Site,
                                     const Provenance &EventProvenance,
-                                    bool ExplicitAssertion) {
+                                    unsigned Sequence) {
     std::map<const Invocation *, Provenance> ByCall;
     for (const ProjectionSubject &Projection : EventProvenance.projections)
       appendProjection(ByCall[Projection.origin.call], Projection);
     for (auto &[Call, CallProvenance] : ByCall) {
       const AssertionMarker *Marker = ActiveCollector->makeAssertionMarker(
           {Site, Call, std::move(CallProvenance.projections),
-           ExplicitAssertion});
-      State = ExplicitAssertion ? State->add<PendingAssertions>(Marker)
-                                : State->add<ActiveGuards>(Marker);
+           State->get<CurrentOutcomeEpoch>(), Sequence, false});
+      State = State->add<ActiveGuards>(Marker);
     }
     return State;
   }
 
-  static void applyAssertion(const Expr *Expression, bool Expected,
-                             CheckerContext &C) {
+  static const Expr *branchExpressionRoot(const Expr *Expression,
+                                          ASTContext &Context) {
+    const Expr *Current = Expression;
+    for (unsigned Depth = 0; Current && Depth < 32; ++Depth) {
+      auto Parents = Context.getParents(*Current);
+      if (Parents.size() != 1)
+        break;
+      const auto *Parent = Parents[0].get<Expr>();
+      if (!Parent)
+        break;
+      bool PredicateWrapper = isa<ParenExpr>(Parent) || isa<CastExpr>(Parent);
+      if (const auto *Unary = dyn_cast<UnaryOperator>(Parent))
+        PredicateWrapper |= Unary->getOpcode() == UO_LNot;
+      if (const auto *Binary = dyn_cast<BinaryOperator>(Parent))
+        PredicateWrapper |= Binary->getOpcode() == BO_LAnd ||
+                            Binary->getOpcode() == BO_LOr;
+      if (!PredicateWrapper)
+        break;
+      Current = Parent;
+    }
+    return Current ? Current : Expression;
+  }
+
+  static void registerGuard(const Expr *Expression, CheckerContext &C) {
+    Expression = branchExpressionRoot(Expression, C.getASTContext());
     Provenance EventProvenance;
     collectProvenance(Expression, C, EventProvenance);
     if (EventProvenance.projections.empty())
       return;
-    ProgramStateRef Base = C.getState();
-    if (auto Value = C.getSVal(Expression).getAs<DefinedOrUnknownSVal>()) {
-      Base = Base->assume(*Value, Expected);
-      if (!Base) {
-        C.addSink();
-        return;
-      }
-    }
-    Base = addMarkers(Base, Expression, EventProvenance, true);
-    C.addTransition(Base);
-  }
-
-  static ProgramStateRef assumeEqual(ProgramStateRef State, SVal LHS, SVal RHS,
-                                     CheckerContext &C) {
-    auto Left = LHS.getAs<DefinedOrUnknownSVal>();
-    auto Right = RHS.getAs<DefinedOrUnknownSVal>();
-    if (!Left || !Right)
-      return State;
-    DefinedOrUnknownSVal Equal =
-        C.getSValBuilder().evalEQ(State, *Left, *Right);
-    return State->assume(Equal, true);
-  }
-
-  static bool applyAssertionCall(const CallEvent &Call,
-                                 const CallSemantics &Semantics,
-                                 CheckerContext &C) {
-    bool SysEq = Semantics.kind == SemanticCallKind::SyscallEqualAssertion &&
-                 Call.getNumArgs() >= 2;
-    bool SysZero = Semantics.kind == SemanticCallKind::SyscallZeroAssertion &&
-                   Call.getNumArgs() >= 1;
-    bool SysError = Semantics.kind == SemanticCallKind::SyscallErrorAssertion &&
-                    Call.getNumArgs() >= 3;
-    if (!SysEq && !SysZero && !SysError)
-      return false;
-
-    Provenance EventProvenance;
-    if (const Expr *Argument = Call.getArgExpr(0))
-      collectProvenance(Argument, C, EventProvenance);
-    if (EventProvenance.projections.empty())
-      return true;
     ProgramStateRef State = C.getState();
-    SVal Expected =
-        SysZero
-            ? C.getSValBuilder().makeIntVal(0, Call.getArgExpr(0)->getType())
-            : Call.getArgSVal(1);
-    State = assumeEqual(State, Call.getArgSVal(0), Expected, C);
-    if (!State) {
-      C.addSink();
-      return true;
-    }
-
-    if (SysError) {
-      std::vector<const Invocation *> Calls;
-      for (const ProjectionSubject &Projection : EventProvenance.projections)
-        if (Projection.origin.field == EventField::Result &&
-            std::find(Calls.begin(), Calls.end(), Projection.origin.call) ==
-                Calls.end())
-          Calls.push_back(Projection.origin.call);
-      for (const Invocation *Invocation : Calls) {
-        if (!Invocation->errnoSymbol)
-          continue;
-        State = assumeEqual(State, nonloc::SymbolVal(Invocation->errnoSymbol),
-                            Call.getArgSVal(2), C);
-        if (!State) {
-          C.addSink();
-          return true;
-        }
-        appendProjection(EventProvenance, {{Invocation, EventField::Errno,
-                                            Invocation->errnoSymbol},
-                                           Invocation->errnoSymbol,
-                                           ProjectionTransform::Identity});
-      }
-    }
-
-    const Expr *Site = Call.getOriginExpr();
-    State = addMarkers(State, Site, EventProvenance, true);
-    C.addTransition(State);
-    return true;
-  }
-
-  static void registerGuard(const Expr *Expression, CheckerContext &C) {
-    Provenance EventProvenance;
-    collectProvenance(Expression, C, EventProvenance);
-    if (!EventProvenance.projections.empty())
-      C.addTransition(
-          addMarkers(C.getState(), Expression, EventProvenance, false));
+    unsigned Sequence = State->get<NextOutcomeCandidate>() + 1;
+    State = State->set<NextOutcomeCandidate>(Sequence);
+    C.addTransition(addMarkers(State, Expression, EventProvenance, Sequence));
   }
 
   static void observeMarker(const AssertionMarker *Marker,
@@ -2337,9 +2263,9 @@ class SyscallScenarioChecker
         ActiveCollector->observe(Marker, std::move(*Scenario));
   }
 
-  /* Reporter calls close the guards accumulated since the previous reporter.
-   * This includes every CFG component of compound conditions such as a && b.
-   * Completed earlier tests have already removed their guards from the state. */
+  /* Complete every currently attributed candidate on this path.  This is used
+   * by effects whose adapter policy covers the active control context; epoch
+   * boundaries use completeOutcomeEpoch() below instead. */
   static ProgramStateRef completeActiveGuards(ProgramStateRef State,
                                               PathOutcome Outcome) {
     ProgramStateRef Result = State;
@@ -2365,14 +2291,140 @@ class SyscallScenarioChecker
     return Result;
   }
 
-  static void observePendingAssertions(ProgramStateRef State) {
-    for (const AssertionMarker *Marker : State->get<PendingAssertions>())
-      observeMarker(Marker, State);
+  static ProgramStateRef completeInnermostGuards(ProgramStateRef State,
+                                                 PathOutcome Outcome) {
+    unsigned Latest = 0;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      Latest = std::max(Latest, Marker->sequence);
+    if (!Latest)
+      return State;
+
+    ProgramStateRef Result = State;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>()) {
+      if (Marker->sequence != Latest)
+        continue;
+      switch (Outcome) {
+      case PathOutcome::Pass:
+        observeMarker(Marker, State);
+        break;
+      case PathOutcome::Fail:
+      case PathOutcome::Broken:
+        ActiveCollector->markFailure(Marker);
+        break;
+      case PathOutcome::Skip:
+        ActiveCollector->markSkip(Marker);
+        break;
+      case PathOutcome::Neutral:
+        break;
+      }
+      Result = Result->remove<ActiveGuards>(Marker);
+    }
+    return Result;
+  }
+
+  /* A report/counter boundary describes one framework result.  Aggregate all
+   * event projections accumulated in the epoch into one observation per
+   * syscall event, instead of treating each CFG component as an assertion. */
+  static ProgramStateRef completeOutcomeEpoch(ProgramStateRef State,
+                                              PathOutcome Outcome) {
+    std::map<const Invocation *, Provenance> ByCall;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      for (const ProjectionSubject &Projection : Marker->projections)
+        appendProjection(ByCall[Projection.origin.call], Projection);
+
+    for (auto &[Call, EventProvenance] : ByCall) {
+      const AssertionMarker *Marker = ActiveCollector->makeAssertionMarker(
+          {nullptr, Call, std::move(EventProvenance.projections),
+           State->get<CurrentOutcomeEpoch>(), 0, true});
+      switch (Outcome) {
+      case PathOutcome::Pass:
+        observeMarker(Marker, State);
+        break;
+      case PathOutcome::Fail:
+      case PathOutcome::Broken:
+        ActiveCollector->markFailure(Marker);
+        break;
+      case PathOutcome::Skip:
+        ActiveCollector->markSkip(Marker);
+        break;
+      case PathOutcome::Neutral:
+        break;
+      }
+    }
+
+    ProgramStateRef Result = State;
+    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
+      Result = Result->remove<ActiveGuards>(Marker);
+    return Result;
+  }
+
+  static ProgramStateRef completeForScope(ProgramStateRef State,
+                                          PathOutcome Outcome,
+                                          OutcomeScope Scope) {
+    switch (Scope) {
+    case OutcomeScope::ActiveCandidates:
+      return completeActiveGuards(State, Outcome);
+    case OutcomeScope::InnermostCandidates:
+      return completeInnermostGuards(State, Outcome);
+    case OutcomeScope::Epoch:
+      return completeOutcomeEpoch(State, Outcome);
+    }
+    return State;
   }
 
   static void observeActiveGuards(ProgramStateRef State) {
     for (const AssertionMarker *Marker : State->get<ActiveGuards>())
       observeMarker(Marker, State);
+  }
+
+  static ProgramStateRef advanceOutcomeEpoch(ProgramStateRef State) {
+    return State->set<CurrentOutcomeEpoch>(
+        State->get<CurrentOutcomeEpoch>() + 1);
+  }
+
+  static unsigned encodeFrameworkStatus(PathOutcome Outcome) {
+    return static_cast<unsigned>(Outcome) + 1;
+  }
+
+  static std::optional<PathOutcome>
+  frameworkStatus(ProgramStateRef State) {
+    unsigned Encoded = State->get<FrameworkStatus>();
+    if (!Encoded)
+      return std::nullopt;
+    unsigned Raw = Encoded - 1;
+    if (Raw > static_cast<unsigned>(PathOutcome::Neutral))
+      return std::nullopt;
+    return static_cast<PathOutcome>(Raw);
+  }
+
+  static bool acceptsAtTestEnd(ProgramStateRef State) {
+    auto Status = frameworkStatus(State);
+    return !Status || *Status == PathOutcome::Pass ||
+           *Status == PathOutcome::Neutral;
+  }
+
+  static ProgramStateRef applyStatusWrite(
+      ProgramStateRef State, PathOutcome Outcome,
+      OutcomeScope Scope = OutcomeScope::InnermostCandidates) {
+    if (Outcome == PathOutcome::Fail || Outcome == PathOutcome::Broken ||
+        Outcome == PathOutcome::Skip)
+      State = completeForScope(State, Outcome, Scope);
+    return State->set<FrameworkStatus>(encodeFrameworkStatus(Outcome));
+  }
+
+  static ProgramStateRef applyNonTerminalEffect(ProgramStateRef State,
+                                                const OutcomeEffect &Effect) {
+    switch (Effect.action) {
+    case OutcomeAction::ReportBoundary:
+    case OutcomeAction::CounterUpdate:
+      State = completeForScope(State, Effect.verdict, Effect.scope);
+      return advanceOutcomeEpoch(State);
+    case OutcomeAction::StatusWrite:
+      return applyStatusWrite(State, Effect.verdict, Effect.scope);
+    case OutcomeAction::Terminate:
+      return State;
+    }
+    return State;
   }
 
   static std::optional<PathOutcome> ksftOutcomeForCode(int64_t Code) {
@@ -2390,20 +2442,6 @@ class SyscallScenarioChecker
     }
   }
 
-  static void markFailureGuards(ProgramStateRef State) {
-    if (!ActiveCollector)
-      return;
-    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
-      ActiveCollector->markFailure(Marker);
-  }
-
-  static void markSkippedGuards(ProgramStateRef State) {
-    if (!ActiveCollector)
-      return;
-    for (const AssertionMarker *Marker : State->get<ActiveGuards>())
-      ActiveCollector->markSkip(Marker);
-  }
-
   static bool modelLtpReporter(const CallEvent &Call, CheckerContext &C) {
     if (Call.getNumArgs() < 3)
       return false;
@@ -2416,28 +2454,20 @@ class SyscallScenarioChecker
     auto Outcome = ltpOutcome(Value);
     if (!Outcome)
       return false;
-
-    switch (*Outcome) {
-    case PathOutcome::Fail:
-    case PathOutcome::Broken:
-      markFailureGuards(C.getState());
-      C.addSink();
-      return true;
-    case PathOutcome::Skip:
-      markSkippedGuards(C.getState());
-      C.addSink();
-      return true;
-    case PathOutcome::Pass:
-    case PathOutcome::Neutral:
-      // tst_brk_ terminates the current test process even for non-failure
-      // results. Such a terminal path is not evidence for an assertion.
-      if (namedCall(Call, "tst_brk_"))
-        C.addSink();
-      else
-        C.addTransition(C.getState());
+    if (namedCall(Call, "tst_brk_")) {
+      // A passing/neutral tst_brk_ terminates without establishing an
+      // assertion. Rejected outcomes still classify the active candidates.
+      ProgramStateRef State = C.getState();
+      if (*Outcome == PathOutcome::Fail || *Outcome == PathOutcome::Broken)
+        State = completeOutcomeEpoch(State, *Outcome);
+      else if (*Outcome == PathOutcome::Skip)
+        State = completeActiveGuards(State, *Outcome);
+      C.addSink(State);
       return true;
     }
-    return false;
+    OutcomeEffect Effect{*Outcome, OutcomeAction::ReportBoundary};
+    C.addTransition(applyNonTerminalEffect(C.getState(), Effect));
+    return true;
   }
 
   static const Expr *singlePointeeExpression(const Expr *Pointer) {
@@ -2523,6 +2553,35 @@ class SyscallScenarioChecker
     return Domains;
   }
 
+  static bool isKselftestExitCodeField(const FieldDecl *Field) {
+    if (!Field || Field->getCanonicalDecl()->getName() != "exit_code" ||
+        !Field->getType()->isIntegerType())
+      return false;
+    const RecordDecl *Record = Field->getParent();
+    if (!Record || Record->getCanonicalDecl()->getName() != "__test_metadata")
+      return false;
+    bool HasTrigger = false;
+    for (const FieldDecl *Sibling : Record->fields())
+      HasTrigger |= Sibling->getName() == "trigger" &&
+                    Sibling->getType()->isIntegerType();
+    return HasTrigger;
+  }
+
+  static std::optional<PathOutcome> kselftestStatusWrite(SVal Location,
+                                                         SVal Value) {
+    const auto *Field =
+        dyn_cast_or_null<FieldRegion>(Location.getAsRegion());
+    if (!Field || !isKselftestExitCodeField(Field->getDecl()))
+      return std::nullopt;
+    const llvm::APSInt *Integer = Value.getAsInteger();
+    if (!Integer || Integer->getBitWidth() > 64)
+      return std::nullopt;
+    int64_t Code = Integer->isUnsigned()
+                       ? static_cast<int64_t>(Integer->getZExtValue())
+                       : Integer->getSExtValue();
+    return ksftOutcomeForCode(Code);
+  }
+
 public:
   ProgramStateRef
   checkRegionChanges(ProgramStateRef State,
@@ -2590,6 +2649,8 @@ public:
 
     ProgramStateRef State =
         removeOverlappingRegionProvenance(C.getState(), Region);
+    if (auto Outcome = kselftestStatusWrite(Location, Value))
+      State = applyStatusWrite(State, *Outcome);
 
     if (ActiveCollector) {
       Provenance EventProvenance = provenanceFromValue(
@@ -2628,29 +2689,15 @@ public:
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const {
     CallSemantics Semantics = SemanticDispatcher::classify(Call, C);
-    if (Semantics.kind == SemanticCallKind::KsftOutcome) {
-      if (!Semantics.outcome || !Semantics.terminal)
-        return false;
-      ProgramStateRef State =
-          completeActiveGuards(C.getState(), *Semantics.outcome);
-      if (*Semantics.outcome == PathOutcome::Pass) {
-        observePendingAssertions(State);
-        observeActiveGuards(State);
-      } else {
-        /* Explicit assertions completed before a terminal failure or skip are
-         * still valid observations from earlier tests. */
-        observePendingAssertions(State);
-      }
-      C.addSink();
+    if (Semantics.outcome &&
+        Semantics.outcome->action == OutcomeAction::Terminate) {
+      ProgramStateRef State = completeForScope(
+          C.getState(), Semantics.outcome->verdict, Semantics.outcome->scope);
+      C.addSink(State);
       return true;
     }
     if (Semantics.kind == SemanticCallKind::KsftResultCode)
       return false;
-    if (Semantics.kind == SemanticCallKind::Failure) {
-      markFailureGuards(C.getState());
-      C.addSink();
-      return true;
-    }
     if (Semantics.kind == SemanticCallKind::LtpReporter)
       return modelLtpReporter(Call, C);
     if (Semantics.kind == SemanticCallKind::LtpErrnoSet)
@@ -2761,45 +2808,12 @@ public:
     return true;
   }
 
-  void checkPreStmt(const ReturnStmt *Return, CheckerContext &C) const {
-    if (Return && skipMacroAt(Return->getReturnLoc(), C)) {
-      ProgramStateRef State =
-          completeActiveGuards(C.getState(), PathOutcome::Skip);
-      observePendingAssertions(State);
-      C.addSink();
-      return;
-    }
-    if (knownFailureReturn(Return, C)) {
-      markFailureGuards(C.getState());
-      C.addSink();
-    }
-  }
-
-  void checkPreStmt(const GotoStmt *Goto, CheckerContext &C) const {
-    if (!Goto || !skipMacroAt(Goto->getGotoLoc(), C))
-      return;
-    ProgramStateRef State =
-        completeActiveGuards(C.getState(), PathOutcome::Skip);
-    observePendingAssertions(State);
-    C.addSink();
-  }
-
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
     CallSemantics Semantics = SemanticDispatcher::classify(Call, C);
-    if (Semantics.kind == SemanticCallKind::BooleanAssertion &&
-        Call.getNumArgs() > 0) {
-      if (const Expr *Condition = Call.getArgExpr(0))
-        applyAssertion(Condition, true, C);
-      return;
-    }
-    if (applyAssertionCall(Call, Semantics, C))
-      return;
-    if (Semantics.kind == SemanticCallKind::KsftOutcome &&
-        Semantics.outcome && !Semantics.terminal) {
-      ProgramStateRef State =
-          completeActiveGuards(C.getState(), *Semantics.outcome);
-      if (State != C.getState())
-        C.addTransition(State);
+    if (Semantics.outcome &&
+        Semantics.outcome->action != OutcomeAction::Terminate) {
+      C.addTransition(
+          applyNonTerminalEffect(C.getState(), *Semantics.outcome));
       return;
     }
     if (Semantics.kind == SemanticCallKind::KsftResultCode) {
@@ -2810,10 +2824,9 @@ public:
                                 ? static_cast<int64_t>(Code->getZExtValue())
                                 : Code->getSExtValue();
             if (auto Outcome = ksftOutcomeForCode(Value)) {
-              ProgramStateRef State =
-                  completeActiveGuards(C.getState(), *Outcome);
-              if (State != C.getState())
-                C.addTransition(State);
+              OutcomeEffect Effect{*Outcome, OutcomeAction::ReportBoundary,
+                                   OutcomeScope::Epoch};
+              C.addTransition(applyNonTerminalEffect(C.getState(), Effect));
             }
           }
         }
@@ -2829,21 +2842,17 @@ public:
     }
     if (Semantics.contextEffect == ContextEffect::Preserve)
       return;
+    if (const auto *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl())) {
+      const FunctionDecl *Definition = nullptr;
+      if (FD->hasBody(Definition))
+        return;
+    }
     if (!C.getState()->get<CurrentErrnoOwner>())
       return;
     C.addTransition(C.getState()->remove<CurrentErrnoOwner>());
   }
 
   void checkPostStmt(const BinaryOperator *Compare, CheckerContext &C) const {
-    if (Compare->isAssignmentOp() &&
-        (skipMacroAt(Compare->getOperatorLoc(), C) ||
-         skipMacroAt(Compare->getExprLoc(), C))) {
-      ProgramStateRef State =
-          completeActiveGuards(C.getState(), PathOutcome::Skip);
-      if (State != C.getState())
-        C.addTransition(State);
-      return;
-    }
     if (!Compare->isComparisonOp())
       return;
     ProgramStateRef State = C.getState();
@@ -2915,26 +2924,14 @@ public:
     const CFGBlock *Block = C.getCFGElementRef().getParent();
     if (!Expression || !Block)
       return;
-    if (const auto *If = dyn_cast_or_null<IfStmt>(Block->getTerminatorStmt())) {
-      if (ignoreExpr(Expression) == ignoreExpr(If->getCond())) {
-        std::optional<bool> Expected =
-            assertionExpectedAt(If->getIfLoc(), C);
-        if (!Expected)
-          Expected = assertionExpectedAt(Expression->getExprLoc(), C);
-        if (Expected) {
-          applyAssertion(Expression, *Expected, C);
-          return;
-        }
-      }
-    }
     registerGuard(Expression, C);
   }
 
   void checkEndFunction(const ReturnStmt *, CheckerContext &C) const {
     if (!C.inTopFrame() || !ActiveCollector)
       return;
-    observePendingAssertions(C.getState());
-    observeActiveGuards(C.getState());
+    if (acceptsAtTestEnd(C.getState()))
+      observeActiveGuards(C.getState());
   }
 };
 

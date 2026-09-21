@@ -4,6 +4,7 @@
 extern long syscall(long number, ...);
 extern int unknown_value(void);
 extern unsigned unknown_unsigned(void);
+extern void test__fail(void);
 
 #define TEST(name) static void name(void)
 #define EXPECT_EQ(expected, seen)                                              \
@@ -11,6 +12,7 @@ extern unsigned unknown_unsigned(void);
     __typeof__(expected) __expected = (expected);                              \
     __typeof__(seen) __seen = (seen);                                          \
     if (!(__expected == __seen)) {                                             \
+      test__fail();                                                            \
     }                                                                          \
   } while (0)
 

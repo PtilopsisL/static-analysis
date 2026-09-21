@@ -121,7 +121,7 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 }
 ```
 
-结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。每次可建模的 syscall 都建立一个包含独立 `ret` / `errno` symbol 的 event；comparison 和 bind event 只传播该 event 的 provenance，不解释 C 表达式来合成比较约束。断言适配器把成功条件交给 Clang `assume()`，已知 failure API 被建模为 sink；到达正常函数出口时，checker 直接读取 Clang `ProgramState` 中的 `RangeSet`，再把范围投影到输出 schema。对取负等可逆且保持有符号整数语义的派生 symbol，投影层会把 Clang 已求得的范围映射回 event 字段；signedness 改变、narrowing 或其他无法证明可逆的转换会被过滤，不存在 AST 比较式回退。
+结果采用保守的欠近似：允许漏掉无法证明的场景，但不为未知值猜常量。每次可建模的 syscall 都建立一个包含独立 `ret` / `errno` symbol 的 event；comparison 和 bind event 只传播该 event 的 provenance，不解释 C 表达式来合成比较约束。framework adapter 只把调用、状态写入和终止行为分类为 `Pass / Fail / Skip` 等 outcome effect；report/counter boundary 关闭当前 outcome epoch，harness status write 则保留到 test 结束。checker 只观察 Clang 实际探索到的 accepted path，并直接读取其 `ProgramState` 中的 `RangeSet`，不会从失败分支反向构造成功状态。对取负等可逆且保持有符号整数语义的派生 symbol，投影层会把 Clang 已求得的范围映射回 event 字段；signedness 改变、narrowing 或其他无法证明可逆的转换会被过滤，不存在 AST 比较式回退。
 
 同一 assertion 的成功路径按 event 聚合，并且仅在另一字段范围相同时对 `ret` 或 `errno` 做精确并集。因此 `A || true` 会自然并成无约束而不输出，`ret` / `errno` 的分支相关性也不会被错误交叉组合。范围只在输出边界投影成当前 schema 的单个比较式：例如 `ret >= 0 && ret >= 1` 可投影为 `ret >= 1`，最终仍为 `0 <= ret && ret < 10` 时会保守过滤；中间范围若继续被 `ret == 5` 收窄，则可以精确输出。未知参数、被不透明调用修改的内存、不可规范化断言和不可满足约束同样都会被过滤。
 
@@ -131,12 +131,12 @@ python3 scan_artifacts.py /path/to/build/compile_commands.json \
 - 在显式选择 `glibc-linux-x86_64` profile 时，对经过审核的外部 libc
   wrapper 使用分析期语义模型；
 - Clang 能分析的分支、循环、数组/结构体初始化和局部内存；
-- 通过宏展开来源识别常见 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 断言，并通过统一的 call-semantics dispatcher 为 ksft、BPF、nolibc 和 LTP 提供薄语义适配；不依赖 `__exp` / `__seen` 之类临时变量名；
+- 通过统一的 outcome-effect dispatcher 为 ksft、BPF、nolibc 和 LTP 提供薄语义适配，并把 `struct __test_metadata::exit_code` 的已知状态写入识别为 harness outcome；不匹配 `EXPECT_*` / `ASSERT_*` / `CHECK_OP` 等宏名，也不依赖 `_metadata`、`__exp` 或 `__seen` 等变量名；
 - LTP 风格的 `TEST` / `TST_RET` / `TST_ERR` 传播、`TST_EXP_*` 结果路径和单个具体 errno 的 `tst_errno_in_set`；`TFAIL` / `TBROK` 作为拒绝路径，`TCONF` 只跳过路径而不形成 oracle，`TPASS` / `TINFO` 等不会被误判为失败；
 - syscall 返回值以及紧随其后的 `errno` 约束；
 - 指向具体结构体和字符串的 syscall 参数快照。
 
-控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他断言框架或 API 时，应增加只负责提交 Clang 假设和标记 event provenance 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。普通 guard 只有在对应路径实际到达已知 failure sink 后才成为 oracle。
+控制流能力来自 Clang Static Analyzer，不再由项目内手写求值器逐种实现。syscall 和测试框架的特殊行为仍属于领域模型；扩展其他框架或 API 时，应增加只负责声明 outcome effect、boundary policy 或 framework state transfer 的薄适配器，而不是复制一套 C/C++ 执行器。predicate 临时值的来源随 analyzer 的 bind event 按 `TypedValueRegion` 保存在 `ProgramState` 中，重新赋值会替换与父/子 region 重叠的旧来源，opaque invalidation 则通过 `RegionChanges` 清除受影响的来源；comparison concrete 化时的桥接信息以 `(Expr, LocationContext)` 求值点保存，并仅在 Clang 当前路径证明短路 RHS 确实执行时合并。outcome epoch 管理生命周期，candidate marker 管理 effect 与 event 的归属；accepted alternatives 只在同一 observation group 内做精确并集，避免把条件 assertion 的 bypass path 混入该 assertion。
 
 ## libc wrapper 分析模型
 

@@ -5,12 +5,14 @@
 
 extern int *__errno_location(void) __attribute__((const));
 extern long syscall(long number, ...);
+extern void test__fail(void);
 
 #define CHECK_OP(expected, seen, op)           \
   do {                                         \
     __typeof__(expected) wanted = (expected);  \
     __typeof__(seen) observed = (seen);        \
     if (!(wanted op observed)) {               \
+      test__fail();                            \
     }                                          \
   } while (0)
 

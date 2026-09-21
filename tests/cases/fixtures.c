@@ -30,6 +30,7 @@ struct predicate_box {
     __typeof__(expected) __exp = (expected);                              \
     __typeof__(seen) __seen = (seen);                                     \
     if (!(__exp op __seen)) {                                             \
+      test__fail();                                                       \
     }                                                                     \
   } while (0)
 #define EXPECT_EQ(expected, seen) EXPECT_OP(expected, seen, ==)
@@ -47,7 +48,18 @@ extern void mutate(int *value);
 extern void mutate_predicate_box(struct predicate_box *box);
 extern void abort(void) __attribute__((noreturn));
 extern void exit_success(void) __attribute__((noreturn));
-extern void ksft_test_result(int condition, const char *format, ...);
+extern void test__fail(void);
+extern void test__report_pass(void);
+extern void test__report_fail(void);
+
+#define ksft_test_result(condition, format, ...)                           \
+  do {                                                                    \
+    (void)(format);                                                       \
+    if (condition)                                                        \
+      test__report_pass();                                                \
+    else                                                                  \
+      test__report_fail();                                                \
+  } while (0)
 
 static long getfd(int pidfd, int fd, unsigned flags) {
   return syscall(__NR_pidfd_getfd, pidfd, fd, flags);
@@ -202,17 +214,22 @@ TEST(unsigned_cast_ordering) {
 
 static int compound_failure_condition(long gate) {
   long ret = getfd(608, 0, 0);
-  if (ret != 0 && gate)
+  if (ret != 0 && gate) {
+    test__fail();
     return KSFT_FAIL;
+  }
   return 0;
 }
 
 static int both_branches_fail(void) {
   long ret = getfd(609, 0, 0);
-  if (ret == 0)
+  if (ret == 0) {
+    test__fail();
     return KSFT_FAIL;
-  else
+  } else {
+    test__fail();
     return KSFT_FAIL;
+  }
 }
 
 TEST(predicate_reassigned_after_assertion) {

@@ -16,10 +16,11 @@ CLANG = os.environ.get("CLANG", shutil.which("clang-21") or shutil.which("clang"
 SOURCE = r"""
 #define O_RDONLY 0
 #define O_CREAT 0100
+extern void test__fail(void);
 #define EXPECT_OP(expected, seen, op) do { \
   __typeof__(expected) e = (expected);       \
   __typeof__(seen) s = (seen);               \
-  if (!(e op s)) {}                          \
+  if (!(e op s)) test__fail();               \
 } while (0)
 #define EXPECT_EQ(expected, seen) EXPECT_OP(expected, seen, ==)
 #define EXPECT_GE(seen, minimum) EXPECT_OP(seen, minimum, >=)
